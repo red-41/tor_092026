@@ -1,0 +1,116 @@
+name: Collect performances
+
+on:
+  schedule:
+    - cron: "0 1 * * 1"        # every Monday 01:00 UTC; each source is only read when it is due
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight = free check that every site opens (no Claude). collect = read schedules into staging."
+        type: choice
+        options: [preflight, collect]
+        default: preflight
+      priority:
+        description: "collect: only this priority (1, 2 or 3); empty = all"
+        default: ""
+      name:
+        description: "Only sources whose name contains this text"
+        default: ""
+      limit:
+        description: "collect: max sources per shard (12 shards run side by side)"
+        default: "100"
+      dry:
+        description: "collect: read and report, write nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  MODEL: ${{ vars.MODEL || 'claude-sonnet-5' }}
+  MODE: ${{ github.event.inputs.mode || 'collect' }}
+  NAME: ${{ github.event.inputs.name }}
+  PRIORITY: ${{ github.event.inputs.priority }}
+  LIMIT: ${{ github.event.inputs.limit || '100' }}
+  DRY: ${{ github.event.inputs.dry || 'false' }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Preflight (free)
+        if: env.MODE == 'preflight'
+        run: python -m collector.preflight --shard ${{ matrix.shard }} --shards 12 ${NAME:+--name "$NAME"}
+      - name: Collect
+        if: env.MODE != 'preflight'
+        run: |
+          python -m collector.run --shard ${{ matrix.shard }} --shards 12 --limit "$LIMIT" \
+            ${PRIORITY:+--priority "$PRIORITY"} ${NAME:+--name "$NAME"} $( [ "$DRY" = "true" ] && echo --dry )
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-shard-${{ matrix.shard }}
+          path: reports/
+          if-no-files-found: ignore
+
+  summary:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-shard-*
+          path: all-reports
+          merge-multiple: true
+      - run: python -m collector.combine all-reports
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-results
+          path: all-reports/
+
+  # Optional: sites that block GitHub's servers are retried from your own computer.
+  # Needs a self-hosted runner (see README) and the repository variable HOME_RUNNER = true.
+  from-home:
+    needs: run
+    if: always() && vars.HOME_RUNNER == 'true' && github.event.inputs.mode != 'preflight'
+    runs-on: self-hosted
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt && python -m playwright install chromium
+      - name: Retry blocked sources
+        run: python -m collector.run --status blocked --limit 500 $( [ "$DRY" = "true" ] && echo --dry )
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-from-home
+          path: reports/
+          if-no-files-found: ignore
