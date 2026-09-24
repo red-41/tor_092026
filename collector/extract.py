@@ -93,6 +93,8 @@ class Extractor:
         self.model = model or config.MODEL
         self.input_tokens = 0
         self.output_tokens = 0
+        self.calls = 0
+        self.cache_hits = 0
 
     def read(self, snap, source: dict, venues: list[dict], role: str) -> dict:
         today = dt.date.today().isoformat()
@@ -112,10 +114,12 @@ class Extractor:
             + "Page text:\n" + snap.text[: config.PAGE_TEXT_LIMIT]
         )
         resp = self.client.messages.create(
-            model=self.model, max_tokens=32000, system=SYSTEM, tools=[TOOL],
+            model=self.model, max_tokens=32000, tools=[TOOL],
+            system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
             tool_choice={"type": "tool", "name": "record_page"},
             messages=[{"role": "user", "content": user}],
         )
+        self.calls += 1
         self.input_tokens += resp.usage.input_tokens
         self.output_tokens += resp.usage.output_tokens
         truncated = getattr(resp, "stop_reason", None) == "max_tokens"
@@ -124,9 +128,17 @@ class Extractor:
                 data = dict(block.input)
                 if truncated:
                     data["notes"] = ((data.get("notes") or "") + " [answer cut off: page too long]").strip()
+                    data["_truncated"] = True
                 return data
-        return {"page_status": "not_a_schedule", "productions": [], "detail_links": [],
-                "notes": "no answer (page too long)" if truncated else None}
+        return {"page_status": "not_a_schedule", "productions": [], "detail_links": [], "_truncated": True,
+                "notes": "no answer (page too long)" if truncated else "no answer"}
+
+
+def page_hash(snap) -> str:
+    """Fingerprint of what Claude would be shown; same fingerprint means the page did not change."""
+    import hashlib
+    body = snap.text[: config.PAGE_TEXT_LIMIT] + json.dumps(snap.events, sort_keys=True, ensure_ascii=False)[:20000]
+    return hashlib.sha256(body.encode()).hexdigest()
 
 
 def flatten(data: dict) -> list[dict]:

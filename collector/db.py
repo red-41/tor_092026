@@ -19,26 +19,41 @@ def _client() -> httpx.Client:
         base_url=config.SUPABASE_URL + "/rest/v1",
         headers={
             "apikey": config.SUPABASE_SERVICE_KEY,
-            "Authorization": "Bearer " + config.SUPABASE_SERVICE_KEY,
             "Content-Type": "application/json",
+            # legacy service_role keys are JWTs (eyJ...); new sb_secret_ keys go in apikey only
+            **({"Authorization": "Bearer " + config.SUPABASE_SERVICE_KEY}
+               if config.SUPABASE_SERVICE_KEY.startswith("eyJ") else {}),
         },
         timeout=60,
     )
 
 
+ACTIVE = "todo,ok,partial,failed,waiting,blocked"
+
+
+def _shard(rows: list[dict], shard: int, shards: int) -> list[dict]:
+    if shards <= 1:
+        return rows
+    return [s for s in rows if int(hashlib.md5(s["id"].encode()).hexdigest(), 16) % shards == shard]
+
+
 def due_sources(limit: int, priority: int | None = None, name: str | None = None,
-                shard: int = 0, shards: int = 1, include_new: bool = True) -> list[dict]:
-    """Sources whose next check is due, most important and least recently collected first."""
+                shard: int = 0, shards: int = 1, include_new: bool = True, status: str | None = None) -> list[dict]:
+    """Sources whose next check is due, most important and least recently collected first.
+    With status, every source in that status regardless of due date (used to retry blocked sites from home)."""
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     params = {
         "select": "*",
-        "status": "in.(todo,ok,partial,failed,waiting)",
+        "status": f"in.({ACTIVE})",
         "or": f"(next_check_at.is.null,next_check_at.lte.{now})",
         "order": "priority.asc,last_collected_at.asc.nullsfirst,name.asc",
-        "limit": str(limit * max(shards, 1)),
+        "limit": "5000",
     }
     if priority:
         params["priority"] = f"eq.{priority}"
+    if status:
+        params["status"] = f"eq.{status}"
+        params.pop("or")
     if name:
         params = {"select": "*", "name": f"ilike.*{name}*", "limit": "5"}
     if not include_new and not name:
@@ -47,9 +62,62 @@ def due_sources(limit: int, priority: int | None = None, name: str | None = None
         r = c.get("/sources", params=params)
         r.raise_for_status()
         rows = r.json()
-    if shards > 1:
-        rows = [s for s in rows if int(hashlib.md5(s["id"].encode()).hexdigest(), 16) % shards == shard]
-    return rows[:limit]
+    return _shard(rows, shard, shards)[:limit]
+
+
+def all_sources(name: str | None = None, shard: int = 0, shards: int = 1) -> list[dict]:
+    """Every source that is still in use (for the preflight check)."""
+    params = {"select": "*", "status": "not.in.(closed,moved)", "order": "priority.asc,name.asc", "limit": "5000"}
+    if name:
+        params["name"] = f"ilike.*{name}*"
+    with _client() as c:
+        r = c.get("/sources", params=params)
+        r.raise_for_status()
+        return _shard(r.json(), shard, shards)
+
+
+def upcoming_count(source_id: str) -> int | None:
+    """How many future performances from this source are already on the site."""
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        with _client() as c:
+            r = c.get("/performances", params={"select": "id", "source_id": f"eq.{source_id}",
+                                               "performance_date": f"gte.{now}"},
+                      headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"})
+            if r.status_code >= 400:
+                return None
+            total = r.headers.get("content-range", "*/0").split("/")[-1]
+            return int(total) if total.isdigit() else None
+    except Exception:
+        return None
+
+
+def cache_get(url: str, role: str, text_hash: str, model: str, max_age_days: int = 28) -> dict | None:
+    """Last reading of this exact page text, if it is recent and made with the same model."""
+    try:
+        with _client() as c:
+            r = c.get("/collector_page_cache", params={"select": "text_hash,result,model,updated_at",
+                                                        "url": f"eq.{url}", "role": f"eq.{role}"})
+            if r.status_code >= 400 or not r.json():
+                return None
+            row = r.json()[0]
+        age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(row["updated_at"])
+        if row["text_hash"] == text_hash and row["model"] == model and age.days < max_age_days:
+            return row["result"]
+    except Exception:
+        return None
+    return None
+
+
+def cache_put(url: str, role: str, text_hash: str, model: str, result: dict) -> None:
+    try:
+        with _client() as c:
+            c.post("/collector_page_cache", params={"on_conflict": "url,role"},
+                   json={"url": url, "role": role, "text_hash": text_hash, "model": model, "result": result,
+                         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()},
+                   headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
+    except Exception:
+        pass
 
 
 def known_venues(country: str | None) -> list[dict]:
