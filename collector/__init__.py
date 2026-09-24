@@ -1,1 +1,0 @@
-"""Saffitt schedule collector."""
