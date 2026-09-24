@@ -88,6 +88,15 @@ Rules:
 Always answer by calling record_page."""
 
 
+class OutOfCredit(Exception):
+    """The Anthropic account has no credit left."""
+
+
+def _credit_error(e: Exception) -> bool:
+    text = str(e).lower()
+    return "credit balance" in text or "billing" in text or "insufficient" in text and "credit" in text
+
+
 class Extractor:
     def __init__(self, model: str | None = None):
         # generous retries: new Anthropic accounts have low per-minute limits; the SDK waits as told by the API
@@ -97,6 +106,7 @@ class Extractor:
         self.output_tokens = 0
         self.calls = 0
         self.cache_hits = 0
+        self.out_of_credit = False      # set once the account runs dry; nothing more is sent after that
 
     def check(self) -> None:
         """Fail fast with a clear message if the key or the model does not work."""
@@ -109,6 +119,10 @@ class Extractor:
             raise SystemExit(f"Anthropic refused the request (credit or permissions?): {e}")
         except anthropic.NotFoundError:
             raise SystemExit(f"Model '{self.model}' is not available to this key. Set the MODEL variable to one that is.")
+        except anthropic.APIStatusError as e:
+            if _credit_error(e):
+                raise SystemExit("The Anthropic credit is used up. Add credit in the Console (Settings > Billing) and run again.")
+            raise
 
     def request_params(self, snap, source: dict, venues: list[dict], role: str) -> dict:
         """The Claude request for one page (used live or inside a batch)."""
@@ -149,7 +163,15 @@ class Extractor:
                 "notes": "no answer (page too long)" if truncated else "no answer"}
 
     def read(self, snap, source: dict, venues: list[dict], role: str) -> dict:
-        resp = self.client.messages.create(**self.request_params(snap, source, venues, role))
+        if self.out_of_credit:
+            raise OutOfCredit("credit already used up in this run")
+        try:
+            resp = self.client.messages.create(**self.request_params(snap, source, venues, role))
+        except anthropic.APIStatusError as e:
+            if _credit_error(e):
+                self.out_of_credit = True
+                raise OutOfCredit(str(e)) from e
+            raise
         self.calls += 1
         self.input_tokens += resp.usage.input_tokens
         self.output_tokens += resp.usage.output_tokens
@@ -168,6 +190,7 @@ class Batch:
         self.input_tokens = 0
         self.output_tokens = 0
         self.calls = 0
+        self.out_of_credit = False
 
     def add(self, params: dict, context) -> str:
         key = f"p{len(self.requests):06d}"
@@ -180,9 +203,22 @@ class Batch:
         import time
         if not self.requests:
             return {}
+        if self.ex.out_of_credit:
+            self.out_of_credit = True
+            return {}
         client = self.ex.client
-        ids = [client.messages.batches.create(requests=self.requests[i:i + self.CHUNK]).id
-               for i in range(0, len(self.requests), self.CHUNK)]
+        ids = []
+        for i in range(0, len(self.requests), self.CHUNK):
+            try:
+                ids.append(client.messages.batches.create(requests=self.requests[i:i + self.CHUNK]).id)
+            except anthropic.APIStatusError as e:
+                if _credit_error(e):
+                    self.out_of_credit = self.ex.out_of_credit = True
+                    print("batch: the Anthropic credit is used up; these pages wait for the next run", flush=True)
+                    break
+                raise
+        if not ids:
+            return {}
         print(f"batch: {len(self.requests)} pages in {len(ids)} batch(es): {', '.join(ids)}", flush=True)
         pending = set(ids)
         while pending:
@@ -211,6 +247,8 @@ class Batch:
             if bid in pending:
                 continue
             for entry in client.messages.batches.results(bid):
+                if entry.result.type == "errored" and _credit_error(Exception(str(getattr(entry.result, "error", "")))):
+                    self.out_of_credit = self.ex.out_of_credit = True
                 if entry.result.type != "succeeded":
                     continue
                 msg = entry.result.message
@@ -218,14 +256,35 @@ class Batch:
                 self.input_tokens += msg.usage.input_tokens
                 self.output_tokens += msg.usage.output_tokens
                 answers[entry.custom_id] = self.ex.parse(msg)
-        print(f"batch: {len(answers)} of {len(self.requests)} pages answered", flush=True)
+        print(f"batch: {len(answers)} of {len(self.requests)} pages answered"
+              + (" (the Anthropic credit ran out)" if self.out_of_credit else ""), flush=True)
         return answers
 
 
+# Words that change from day to day without the programme changing (ticket availability, "today" labels).
+VOLATILE = re.compile(
+    r"(sold ?out|few (?:tickets|seats|places) left|last (?:tickets|seats|places)|low availability|limited availability|"
+    r"book now|buy tickets|tickets available|waiting ?list|udsolgt|få billetter|ausverkauft|restkarten|wenige karten|"
+    r"\bcomplet\b|dernières places|uitverkocht|laatste kaarten|esaurito|ultimi posti|agotado|últimas entradas|slutsålt|"
+    r"få biljetter|utsolgt|loppuunmyyty|wyprzedane|vyprodáno|elfogyott|esgotado|"
+    r"\d+\s+(?:seats|tickets|places|plätze|pladser|posti|plazas|platser|plaatsen))", re.I)
+DAY_LABEL = re.compile(r"^(today|tomorrow|tonight|heute|morgen|aujourd'hui|demain|ce soir|vandaag|vanavond|oggi|domani|"
+                       r"stasera|hoy|mañana|esta noche|i dag|i morgen|idag|imorgon|tänään|huomenna|dziś|jutro|dnes|zítra)$", re.I)
+
+
 def page_hash(snap) -> str:
-    """Fingerprint of what Claude would be shown; same fingerprint means the page did not change."""
+    """Fingerprint of what matters on a page: its lines (in any order), without ticket-availability noise.
+    Same fingerprint means the programme did not change, so last time's reading is reused for free."""
     import hashlib
-    body = snap.text[: config.PAGE_TEXT_LIMIT] + json.dumps(snap.events, sort_keys=True, ensure_ascii=False)[:20000]
+    lines = set()
+    for line in snap.text[: config.PAGE_TEXT_LIMIT].splitlines():
+        text = " ".join(VOLATILE.sub(" ", line.lower()).split()).strip(" -|·•,:")
+        if len(text) < 3 or DAY_LABEL.match(text):
+            continue
+        lines.add(text)
+    events = [{k: v for k, v in e.items() if k not in ("offers", "remainingAttendeeCapacity")} for e in (snap.events or [])
+              if isinstance(e, dict)]
+    body = "\n".join(sorted(lines)) + json.dumps(events, sort_keys=True, ensure_ascii=False, default=str)[:20000]
     return hashlib.sha256(body.encode()).hexdigest()
 
 

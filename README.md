@@ -59,8 +59,12 @@ After that it runs by itself every Monday at 01:00 UTC. Each run only reads the 
 - **Empty or thin pages** get a second, longer wait for late JavaScript. Pages with nothing on them are not sent to Claude.
 - **Suspiciously few results**: if a site gives less than half of what is already on Saffitt from that source, the report flags it (CHECK) and nothing is removed. Promotion never deletes.
 - **Unchanged pages** are not sent to Claude again (page cache for up to 28 days), so weekly runs cost a fraction of the first.
+  "Unchanged" ignores ticket noise: sold out, few tickets left, seat counts, "today/tomorrow" labels, and lines that only moved around.
 - **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old. New productions are always read.
-- **Batch API**: production pages go to Claude in one bundle at half price, answered within the hour. Listing pages are answered straight away.
+- **Batch API**, in two rounds: first every schedule page, then every production page, each sent to Claude as one bundle at half price.
+  If a bundle is not answered in time, those schedule pages are read straight away at full price; production pages wait for the next run.
+- **Credit runs out**: the run stops sending pages, saves everything found so far, and says so at the top of the report.
+  Sources not finished stay due, so the next run picks them up. A run started with no credit stops at once with a clear message.
 - **Tiers 2 and 3** read at most 15 production pages per site (tiers 0 and 1: 40).
 - **Time cap**: max 25 minutes per site, 40 production pages, 8 listing pages. The rest is picked up next run.
 - **PDF schedules** are read too.

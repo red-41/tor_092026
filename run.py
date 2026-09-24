@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 import config
 import db
 from browse import Browser
-from extract import Batch, Extractor, clean_performance, flatten, merge, page_hash
+from extract import Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash
 
 THIN = 150          # characters: below this a page has nothing to read
 
@@ -92,87 +92,121 @@ def apply_detail(result: dict, data: dict, snap, url: str) -> None:
             result["items"].append(c)
 
 
-def collect_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = True,
-                   max_minutes: float | None = None, batch: Batch | None = None) -> dict:
-    """Read one source. Production pages are answered now, or later through the batch.
-    Call finalize() once every page has an answer (done here when nothing is left for the batch)."""
-    t0 = time.monotonic()
-    max_minutes = max_minutes or config.MAX_SOURCE_MINUTES
-    tz = ZoneInfo(source.get("timezone") or "Europe/Paris")
-    today = dt.datetime.now(tz).date()
-    venues = db.known_venues(source.get("country"))
-    prio = source.get("priority")
-    cap = config.DETAIL_CAP.get(2 if prio is None else prio, config.MAX_DETAIL_PAGES)
-    result = {"source": source, "items": [], "pages": 0, "status": "ok", "notes": [], "schedule_url": None,
-              "blocked": [], "screens": [], "cookies": [], "check": False, "reused": 0, "pending": 0,
-              "_state": {"today": today, "statuses": [], "readable": 0, "out_of_time": False, "details": [], "cap": cap}}
+def open_page(br: Browser, result: dict, url: str):
+    snap = br.load(url)
+    result["pages"] += 1
+    if snap.screenshot:
+        result["screens"].append(snap.screenshot)
+    if snap.cookie not in ("none", "refused"):
+        result["cookies"].append(snap.cookie)
+    reason = _skip_reason(snap)
+    if reason:
+        if snap.blocked:
+            result["blocked"].append(snap.blocked)
+        result["notes"].append(f"{url}: {reason}")
+        return None
+    return snap
+
+
+def handle_listing(result: dict, snap, data: dict) -> None:
+    """Use Claude's reading of a listing page: performances, production pages to open, next pages."""
     st = result["_state"]
+    st["statuses"].append(data.get("page_status"))
+    if data.get("page_status") == "not_a_schedule" and data.get("schedule_url_guess") and st["listings_read"] == 0:
+        guess = data["schedule_url_guess"]
+        if guess not in st["visited"]:
+            result["schedule_url"] = guess
+            st["queue"].insert(0, guess)
+        return
+    st["listings_read"] += 1
+    if st["listings_read"] == 1 and not result["source"].get("schedule_url"):
+        result["schedule_url"] = snap.final_url
+    for p in flatten(data):
+        c = clean_performance(p, st["today"])
+        if c:
+            result["items"].append(c)
+    st["details"] += [u for u in data.get("detail_links", []) if u not in st["details"]]
+    nxt = data.get("next_page_url")
+    if nxt and nxt not in st["visited"]:
+        st["queue"].append(nxt)
+    if data.get("notes"):
+        result["notes"].append(data["notes"])
 
+
+def start_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = True, batch: Batch | None = None) -> dict:
+    """Open a source's schedule page. Its reading comes from the cache, from Claude now, or (batch) later."""
+    tz = ZoneInfo(source.get("timezone") or "Europe/Paris")
+    prio = source.get("priority")
+    result = {"source": source, "items": [], "pages": 0, "status": "ok", "notes": [], "schedule_url": None,
+              "blocked": [], "screens": [], "cookies": [], "check": False, "reused": 0, "pending": 0, "minutes": 0.0,
+              "_state": {"today": dt.datetime.now(tz).date(), "statuses": [], "readable": 0, "listings_read": 0,
+                         "out_of_time": False, "details": [], "visited": set(), "queue": [], "first": None,
+                         "venues": db.known_venues(source.get("country")),
+                         "cap": config.DETAIL_CAP.get(2 if prio is None else prio, config.MAX_DETAIL_PAGES)}}
+    st = result["_state"]
+    t0 = time.monotonic()
     start = source.get("schedule_url") or source.get("website")
-    visited, queue, details = set(), [start], st["details"]
+    st["visited"].add(start)
+    snap = open_page(br, result, start)
+    if snap:
+        st["readable"] += 1
+        h = page_hash(snap)
+        hit = db.cache_get(snap.final_url, LISTING, h, ex.model) if use_cache else None
+        if hit is not None:
+            ex.cache_hits += 1
+            st["first"] = (snap, hit)
+        elif batch is not None:
+            batch.add(ex.request_params(snap, source, st["venues"], LISTING), ("listing", result, snap, snap.final_url, h))
+            result["pending"] += 1
+            st["first"] = (snap, None)
+        else:
+            st["first"] = (snap, read_page(ex, snap, source, st["venues"], LISTING, use_cache))
+    result["minutes"] += (time.monotonic() - t0) / 60
+    return result
 
-    def open_page(url):
-        snap = br.load(url)
-        result["pages"] += 1
-        if snap.screenshot:
-            result["screens"].append(snap.screenshot)
-        if snap.cookie not in ("none", "refused"):
-            result["cookies"].append(snap.cookie)
-        reason = _skip_reason(snap)
-        if reason:
-            if snap.blocked:
-                result["blocked"].append(snap.blocked)
-            result["notes"].append(f"{url}: {reason}")
-            return None
-        return snap
 
-    # 1. listing pages (the schedule, its pagination or next months): always answered straight away
+def continue_source(br: Browser, ex: Extractor, result: dict, use_cache: bool = True, batch: Batch | None = None,
+                    max_minutes: float | None = None) -> dict:
+    """Everything after the first listing page: more listing pages, then the production pages."""
+    t0 = time.monotonic()
+    max_minutes = config.MAX_SOURCE_MINUTES if max_minutes is None else max_minutes
+    source, st = result["source"], result["_state"]
+    venues, visited, queue, details = st["venues"], st["visited"], st["queue"], st["details"]
+    if st["first"]:
+        snap, data = st["first"]
+        if data is None:                                    # the batch gave no answer: read it now
+            data = read_page(ex, snap, source, venues, LISTING, use_cache)
+        st["first"] = None
+        handle_listing(result, snap, data)
+
+    # further listing pages (pagination, next months, or the real schedule page): answered straight away
     while queue and result["pages"] < config.MAX_LISTING_PAGES:
         url = queue.pop(0)
         if url in visited:
             continue
         visited.add(url)
-        snap = open_page(url)
+        snap = open_page(br, result, url)
         if not snap:
             continue
         st["readable"] += 1
-        data = read_page(ex, snap, source, venues, LISTING, use_cache)
-        st["statuses"].append(data.get("page_status"))
-        if data.get("page_status") == "not_a_schedule" and data.get("schedule_url_guess") and st["readable"] == 1:
-            guess = data["schedule_url_guess"]
-            if guess not in visited:
-                result["schedule_url"] = guess
-                queue.insert(0, guess)
-            continue
-        if st["readable"] == 1 and not source.get("schedule_url"):
-            result["schedule_url"] = snap.final_url
-        for p in flatten(data):
-            c = clean_performance(p, today)
-            if c:
-                result["items"].append(c)
-        details += [u for u in data.get("detail_links", []) if u not in details]
-        nxt = data.get("next_page_url")
-        if nxt and nxt not in visited:
-            queue.append(nxt)
-        if data.get("notes"):
-            result["notes"].append(data["notes"])
+        handle_listing(result, snap, read_page(ex, snap, source, venues, LISTING, use_cache))
 
-    # 2. production pages with the individual dates and times
-    for url in details[:cap]:
+    # production pages with the individual dates and times
+    for url in details[: st["cap"]]:
         if url in visited:
             continue
         visited.add(url)
         if use_cache:
             prev = db.cache_peek(url, DETAIL)
-            if reusable(prev, today):                  # read before, next show not soon: no need to open it
+            if reusable(prev, st["today"]):              # read before, next show not soon: no need to open it
                 result["reused"] += 1
                 apply_detail(result, prev["result"], None, url)
                 continue
         if time.monotonic() - t0 > max_minutes * 60:
             st["out_of_time"] = True
-            result["notes"].append(f"stopped after {max_minutes:.0f} minutes; the rest next run")
+            result["notes"].append(f"out of time after {result['pages']} pages; the rest next run")
             break
-        snap = open_page(url)
+        snap = open_page(br, result, url)
         if not snap:
             continue
         st["readable"] += 1
@@ -185,13 +219,19 @@ def collect_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = T
             ex.cache_hits += 1
             apply_detail(result, hit, snap, url)
             continue
-        batch.add(ex.request_params(snap, source, venues, DETAIL), (result, snap, url, h))
+        batch.add(ex.request_params(snap, source, venues, DETAIL), ("detail", result, snap, url, h))
         result["pending"] += 1
 
-    result["minutes"] = round((time.monotonic() - t0) / 60, 1)
+    result["minutes"] = round(result["minutes"] + (time.monotonic() - t0) / 60, 1)
     if not result["pending"]:
         finalize(result)
     return result
+
+
+def collect_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = True,
+                   max_minutes: float | None = None, batch: Batch | None = None) -> dict:
+    """One source start to finish; listing pages answered straight away, production pages through `batch` if given."""
+    return continue_source(br, ex, start_source(br, ex, source, use_cache), use_cache, batch, max_minutes)
 
 
 def finalize(result: dict) -> dict:
@@ -227,16 +267,20 @@ def finalize(result: dict) -> dict:
 
 
 def apply_batch(batch: Batch, answers: dict, ex: Extractor) -> None:
-    """Hand each batch answer back to its source."""
-    for key, (result, snap, url, h) in batch.context.items():
+    """Hand each batch answer back to its source (listing pages or production pages)."""
+    for key, (kind, result, snap, url, h) in batch.context.items():
         data = answers.get(key)
         result["pending"] -= 1
+        role = LISTING if kind == "listing" else DETAIL
+        if data is not None and not data.get("_truncated"):
+            db.cache_put(url, role, h, ex.model, data)
+        if kind == "listing":
+            result["_state"]["first"] = (snap, data)        # None: read it straight away in continue_source
+            continue
         if data is None:
             result["_state"]["unanswered"] = True
             result["notes"].append(f"{url}: no answer from the batch; next run")
             continue
-        if not data.get("_truncated"):
-            db.cache_put(url, DETAIL, h, ex.model, data)
         apply_detail(result, data, snap, url)
 
 
@@ -291,48 +335,107 @@ def main(argv=None):
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--model")
     ap.add_argument("--no-cache", action="store_true", help="send every page to Claude even if unchanged")
-    ap.add_argument("--no-batch", action="store_true", help="answer production pages straight away (full price)")
+    ap.add_argument("--no-batch", action="store_true", help="answer every page straight away (full price)")
     ap.add_argument("--dry", action="store_true", help="read and report only; write nothing to staging or sources")
     args = ap.parse_args(argv)
 
     run_date = dt.date.today().isoformat()
+    use_cache = not args.no_cache
     sources = db.due_sources(args.limit, args.priority, args.name, args.shard, args.shards, status=args.status)
     ex = Extractor(args.model)
     if sources:
         ex.check()
-    batch = Batch(ex) if (config.USE_BATCH and not args.no_batch) else None
-    report = []
+    use_batch = config.USE_BATCH and not args.no_batch
+    listings, details = (Batch(ex), Batch(ex)) if use_batch else (None, None)
+    job_end = started + config.JOB_MINUTES * 60
+    report, results, skipped = [], [], []
     os.makedirs("reports", exist_ok=True)
     print(f"{len(sources)} sources due (shard {args.shard + 1}/{args.shards})"
-          + (", production pages via the Batch API" if batch else ""), flush=True)
+          + (", pages read through the half-price Batch API" if use_batch else ""), flush=True)
 
-    results = []
+    def done(res):
+        res["saved"] = True
+        report.append(save(res, args, run_date))
+
     with Browser(shots_dir="reports/screens", shots="problems") as br:
+        # Round 1: open every schedule page. Unchanged pages reuse last week's reading; the rest go into one batch.
         for s in sources:
+            if ex.out_of_credit:
+                skipped.append(s)
+                continue
             print(f"-> {s['name']}", flush=True)
             try:
-                res = collect_source(br, ex, s, use_cache=not args.no_cache, batch=batch)
-                results.append(res)
-                if not res["pending"]:
-                    report.append(save(res, args, run_date))
+                results.append(start_source(br, ex, s, use_cache, listings))
+            except OutOfCredit:
+                skipped.append(s)
             except Exception as e:
                 traceback.print_exc()
                 report.append(save_failure(s, e, args, run_date))
+        if listings and listings.requests:
+            apply_batch(listings, listings.run(deadline=min(started + config.LISTING_BATCH_MINUTES * 60, job_end)), ex)
 
-    if batch and batch.requests:
-        answers = batch.run(deadline=started + config.JOB_MINUTES * 60)
-        apply_batch(batch, answers, ex)
+        # Round 2: more listing pages, then the production pages (those go into a second batch).
         for res in results:
-            if "upcoming_before" in res:          # already finalised and saved above
+            s, first = res["source"], res["_state"]["first"]
+            if ex.out_of_credit and first and first[1] is None:
+                skipped.append(s)                    # schedule page never read: leave the source due, untouched
+                res["saved"] = True
                 continue
+            left = (job_end - config.DETAIL_RESERVE_MINUTES * 60 - time.time()) / 60
+            budget = 0.0 if ex.out_of_credit else max(0.0, min(config.MAX_SOURCE_MINUTES, left))
+            print(f"=> {s['name']}", flush=True)
+            credit_hit = False
             try:
-                report.append(save(finalize(res), args, run_date))
+                continue_source(br, ex, res, use_cache, details, max_minutes=budget)
+            except OutOfCredit:
+                credit_hit = True
+            except Exception as e:
+                traceback.print_exc()
+                res["saved"] = True
+                report.append(save_failure(s, e, args, run_date))
+                continue
+            if ex.out_of_credit and (credit_hit or res["_state"]["out_of_time"]):
+                credit_stop(res)
+                if not res["items"]:
+                    skipped.append(s)                # nothing found yet: leave the source due, untouched
+                    res["saved"] = True
+                    continue
+                if "upcoming_before" not in res:
+                    finalize(res)
+            if not res["pending"]:
+                done(res)
+
+        if details and details.requests:
+            apply_batch(details, details.run(deadline=job_end), ex)
+        for res in results:
+            if res.get("saved"):
+                continue
+            if details and details.out_of_credit and res["_state"].get("unanswered"):
+                credit_stop(res)
+                if not res["items"]:
+                    skipped.append(res["source"])
+                    continue
+            try:
+                done(finalize(res))
             except Exception as e:
                 traceback.print_exc()
                 report.append(save_failure(res["source"], e, args, run_date))
 
-    write_report(report, ex, args, batch)
+    for s in skipped:
+        report.append({"source": s["name"], "status": "not read", "performances": 0, "staged": 0, "pages": 0,
+                       "reused": 0, "check": False, "blocked": [], "cookies": [], "screens": [], "minutes": 0,
+                       "notes": ["the Anthropic credit ran out before this source; it stays due for the next run"]})
+    write_report(report, ex, args, [b for b in (listings, details) if b], credit_out=ex.out_of_credit)
     return 0
+
+
+def credit_stop(res: dict) -> None:
+    """The credit ran out part way through a source: keep what was found, look again at the next run."""
+    res["retry_soon"] = True
+    res["_state"]["unanswered"] = True
+    note = "the Anthropic credit ran out; the rest at the next run"
+    if note not in res["notes"]:
+        res["notes"].append(note)
 
 
 def save(res: dict, args, run_date: str) -> dict:
@@ -340,9 +443,10 @@ def save(res: dict, args, run_date: str) -> dict:
     s = res["source"]
     rows = to_staging(res, run_date)
     staged = 0 if args.dry else db.stage(rows)
+    days = 0 if res.get("retry_soon") else recheck_days(s, len(rows))    # credit ran out: due again straight away
     fields = {
         "status": res["status"],
-        "next_check_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=recheck_days(s, len(rows)))).isoformat(),
+        "next_check_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).isoformat(),
         "notes": ((s.get("notes") or "").split(" || last run:")[0]
                   + f" || last run: {run_date}, {len(rows)} performances, {res['pages']} pages"
                   + (f", {'; '.join(res['notes'])[:300]}" if res["notes"] else "")),
@@ -389,20 +493,25 @@ def _record(s: dict, entry: dict, args) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def write_report(report, ex, args, batch=None):
+def write_report(report, ex, args, batches=(), credit_out=False):
     by = {}
     for r in report:
         by[r["status"]] = by.get(r["status"], 0) + 1
     total = sum(r["performances"] for r in report)
     problems = [r for r in report if r["status"] in ("blocked", "failed") or r["check"]]
-    lines = [f"## Saffitt collector, shard {args.shard + 1}/{args.shards}" + (" (dry run)" if args.dry else ""),
-             f"{len(report)} sources: " + ", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda x: -x[1]))
-             + f". {total} performances found.",
-             f"Claude ({ex.model}): {ex.calls} pages read at full price ({ex.input_tokens:,} tokens in, "
-             f"{ex.output_tokens:,} out)"
-             + (f"; {batch.calls} pages via the Batch API at half price ({batch.input_tokens:,} in, {batch.output_tokens:,} out)"
-                if batch else "")
-             + f"; {ex.cache_hits} unchanged pages and {sum(r.get('reused', 0) for r in report)} production pages reused for free.", ""]
+    b_calls = sum(b.calls for b in batches)
+    b_in = sum(b.input_tokens for b in batches)
+    b_out = sum(b.output_tokens for b in batches)
+    lines = [f"## Saffitt collector, shard {args.shard + 1}/{args.shards}" + (" (dry run)" if args.dry else "")]
+    if credit_out:
+        lines += ["", "**The Anthropic credit ran out during this run.** Everything found before that is saved. "
+                  "Sources marked 'not read' or 'credit ran out' stay due: add credit in the Console, then run again.", ""]
+    lines += [f"{len(report)} sources: " + ", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda x: -x[1]))
+              + f". {total} performances found.",
+              f"Claude ({ex.model}): {b_calls} pages via the Batch API at half price ({b_in:,} tokens in, {b_out:,} out); "
+              f"{ex.calls} pages at full price ({ex.input_tokens:,} in, {ex.output_tokens:,} out); "
+              f"{ex.cache_hits} unchanged pages and {sum(r.get('reused', 0) for r in report)} production pages reused for free.",
+              ""]
     if problems:
         lines += ["### Needs a look", "| Source | Status | Found | Already on site | Why |", "|---|---|---|---|---|"]
         for r in problems:
