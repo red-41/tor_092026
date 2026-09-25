@@ -7,6 +7,7 @@ actively refuses automated visitors, the page is reported as blocked and skipped
 import io
 import json
 import re
+import threading
 import time
 import urllib.robotparser
 from dataclasses import dataclass, field
@@ -215,6 +216,14 @@ class Browser:
 
     def __enter__(self):
         self._pw = sync_playwright().start()
+        self._launch()
+        self.robots = Robots()
+        if self.shots_dir:
+            import os
+            os.makedirs(self.shots_dir, exist_ok=True)
+        return self
+
+    def _launch(self):
         try:        # full Chromium in new headless mode behaves like a normal browser
             self._browser = self._pw.chromium.launch(headless=True, channel="chromium")
         except Exception:
@@ -225,16 +234,41 @@ class Browser:
         self._ctx = self._browser.new_context(
             user_agent=ua, locale="en-GB", viewport={"width": 1366, "height": 900},
             extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"}, ignore_https_errors=True)
-        self.robots = Robots()
-        if self.shots_dir:
-            import os
-            os.makedirs(self.shots_dir, exist_ok=True)
-        return self
+        self._dead = False
+        self.restarts = getattr(self, "restarts", 0)
+
+    def _freeze(self):
+        """Watchdog: a page is still loading after PAGE_HARD_LIMIT_S. A stuck script can block the browser for
+        ever, so the browser is stopped (the waiting call then fails) and load() starts a fresh one."""
+        self._dead = True
+        print(f"watchdog: a page froze for {config.PAGE_HARD_LIMIT_S}s; restarting the browser", flush=True)
+        try:
+            import psutil
+            for p in psutil.Process().children(recursive=True):
+                try:
+                    name = p.name().lower()
+                    if "chrom" in name or "headless_shell" in name:
+                        p.kill()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"watchdog: could not stop the browser ({type(e).__name__})", flush=True)
+
+    def _restart(self):
+        for closer in (lambda: self._ctx.close(), lambda: self._browser.close()):
+            try:
+                closer()
+            except Exception:
+                pass
+        self.restarts += 1
+        self._launch()
 
     def __exit__(self, *exc):
-        self._ctx.close()
-        self._browser.close()
-        self._pw.stop()
+        for closer in (lambda: self._ctx.close(), lambda: self._browser.close(), lambda: self._pw.stop()):
+            try:
+                closer()
+            except Exception:
+                pass
 
     # -------------------------------------------------------- cookie banners
     def _click_first(self, frame, selectors) -> bool:
@@ -365,8 +399,14 @@ class Browser:
         if urlparse(url).path.lower().endswith(".pdf"):
             time.sleep(config.DELAY_SECONDS)
             return self._load_pdf(snap)
-        page = self._ctx.new_page()
+        if self._dead:
+            self._restart()
+        watchdog = threading.Timer(config.PAGE_HARD_LIMIT_S, self._freeze)
+        watchdog.daemon = True
+        page = None
         try:
+            page = self._ctx.new_page()
+            watchdog.start()
             resp = None
             for attempt in (1, 2):
                 try:
@@ -437,7 +477,14 @@ class Browser:
         except Exception as e:  # network errors, timeouts, crashes
             snap.error = f"{type(e).__name__}: {str(e)[:200]}"
         finally:
-            if not page.is_closed():
-                page.close()
+            watchdog.cancel()
+            if self._dead:
+                snap.error = f"page froze for {config.PAGE_HARD_LIMIT_S}s; browser restarted"
+            else:
+                try:
+                    if page is not None and not page.is_closed():
+                        page.close()
+                except Exception:
+                    pass
             time.sleep(config.DELAY_SECONDS)
         return snap

@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 import re
+import time
 
 import anthropic
 
@@ -63,9 +64,13 @@ TOOL = {
                 },
             },
             "detail_links": {"type": "array", "items": {"type": "string"},
-                             "description": "URLs of dance productions on this site whose individual dates or times are NOT on this page and must be opened."},
+                             "description": "URLs of single dance productions on this site whose individual dates or times are NOT on this page and must be opened."},
+            "listing_links": {"type": "array", "items": {"type": "string"},
+                              "description": "Up to 3 URLs on this site of pages that list several dance productions: the ballet or dance "
+                                             "programme, a dance category or filter, the season overview or the full calendar. "
+                                             "Only when this page does not already show that list. Never single productions."},
             "next_page_url": {"type": ["string", "null"], "description": "Next page of this listing (pagination or next month), if any."},
-            "schedule_url_guess": {"type": ["string", "null"], "description": "If this is not the schedule, the link most likely to be the dance/ballet programme or full calendar."},
+            "schedule_url_guess": {"type": ["string", "null"], "description": "If this is not the schedule, or it shows no dance: the link most likely to be the dance/ballet programme, dance category or full calendar."},
             "notes": {"type": ["string", "null"], "description": "Anything the editor should know (e.g. programme announced on a date)."},
         },
         "required": ["page_status", "productions", "detail_links"],
@@ -85,6 +90,8 @@ Rules:
 - description: your own words, 1 to 2 sentences, never copied.
 - Use absolute URLs. Prefer the booking link for that exact date as ticket_url, else the production page.
 - If dates or times are only on production pages, list those pages in detail_links (dance productions only).
+- On a homepage or a general page, put the site's dance/ballet programme, dance category or calendar pages in listing_links, and the best one in schedule_url_guess.
+- If the page shows no dance but the site has a dance programme, dance filter or full calendar, give it in schedule_url_guess.
 Always answer by calling record_page."""
 
 
@@ -179,74 +186,87 @@ class Extractor:
 
 
 class Batch:
-    """Anthropic Message Batches: many pages sent at once, answered within the hour, at half price."""
+    """Anthropic Message Batches: pages sent in bundles, answered within the hour, at half price.
+    Bundles can be sent while browsing goes on (submit) and their answers picked up as they finish (poll),
+    so each site is saved as soon as its own pages are answered."""
 
     CHUNK = 800            # requests per batch (keeps each batch well under the 256 MB limit)
+    POLL_S = 60            # how often to ask whether a batch has finished
+    GIVE_UP_S = 300        # after the deadline: time allowed for cancelled batches to stop
 
     def __init__(self, ex: Extractor):
         self.ex = ex
-        self.requests: list[dict] = []
+        self.requests: list[str] = []            # keys of every page added
         self.context: dict[str, object] = {}
+        self._unsent: list[dict] = []
+        self._open: dict[str, list[str]] = {}    # batch id -> keys
+        self._failed: list[str] = []             # could not be sent (credit ran out)
+        self._last_poll = 0.0
         self.input_tokens = 0
         self.output_tokens = 0
         self.calls = 0
+        self.submitted = 0
         self.out_of_credit = False
 
     def add(self, params: dict, context) -> str:
         key = f"p{len(self.requests):06d}"
-        self.requests.append({"custom_id": key, "params": params})
+        self.requests.append(key)
+        self._unsent.append({"custom_id": key, "params": params})
         self.context[key] = context
         return key
 
-    def run(self, deadline: float, poll_s: float = 60) -> dict:
-        """Submit, wait until done or the deadline, and return {key: parsed answer}. Missing keys failed."""
-        import time
-        if not self.requests:
-            return {}
-        if self.ex.out_of_credit:
-            self.out_of_credit = True
-            return {}
-        client = self.ex.client
-        ids = []
-        for i in range(0, len(self.requests), self.CHUNK):
+    @property
+    def unsent(self) -> int:
+        return len(self._unsent)
+
+    @property
+    def busy(self) -> bool:
+        return bool(self._unsent or self._open or self._failed)
+
+    def submit(self) -> None:
+        """Send every page added since the last call."""
+        while self._unsent:
+            if self.ex.out_of_credit:
+                self.out_of_credit = True
+                self._failed += [r["custom_id"] for r in self._unsent]
+                self._unsent = []
+                return
+            chunk = self._unsent[: self.CHUNK]
             try:
-                ids.append(client.messages.batches.create(requests=self.requests[i:i + self.CHUNK]).id)
+                bid = self.ex.client.messages.batches.create(requests=chunk).id
             except anthropic.APIStatusError as e:
                 if _credit_error(e):
                     self.out_of_credit = self.ex.out_of_credit = True
                     print("batch: the Anthropic credit is used up; these pages wait for the next run", flush=True)
-                    break
+                    continue
                 raise
-        if not ids:
-            return {}
-        print(f"batch: {len(self.requests)} pages in {len(ids)} batch(es): {', '.join(ids)}", flush=True)
-        pending = set(ids)
-        while pending:
-            for bid in list(pending):
-                if client.messages.batches.retrieve(bid).processing_status == "ended":
-                    pending.discard(bid)
-            if not pending:
-                break
-            if time.time() > deadline:
-                print("batch: out of time, cancelling what is left", flush=True)
-                for bid in pending:
-                    try:
-                        client.messages.batches.cancel(bid)
-                    except Exception:
-                        pass
-                stop = time.time() + 600
-                while pending and time.time() < stop:
-                    for bid in list(pending):
-                        if client.messages.batches.retrieve(bid).processing_status == "ended":
-                            pending.discard(bid)
-                    time.sleep(15)
-                break
-            time.sleep(poll_s)
-        answers = {}
-        for bid in ids:
-            if bid in pending:
+            self._open[bid] = [r["custom_id"] for r in chunk]
+            self._unsent = self._unsent[self.CHUNK:]
+            self.submitted += 1
+            print(f"batch {bid}: {len(chunk)} pages sent", flush=True)
+
+    def poll(self, force: bool = False) -> list[tuple[str, dict | None]]:
+        """(key, answer) for every page whose batch has finished since the last call; answer None = no answer."""
+        done = [(k, None) for k in self._failed]
+        self._failed = []
+        if not self._open or (not force and time.time() - self._last_poll < self.POLL_S):
+            return done
+        self._last_poll = time.time()
+        for bid in list(self._open):
+            try:
+                ended = self.ex.client.messages.batches.retrieve(bid).processing_status == "ended"
+            except Exception as e:
+                print(f"batch {bid}: status check failed ({type(e).__name__}); trying again later", flush=True)
                 continue
-            for entry in client.messages.batches.results(bid):
+            if ended:
+                done += self._collect(bid)
+        return done
+
+    def _collect(self, bid: str) -> list[tuple[str, dict | None]]:
+        keys = self._open.pop(bid)
+        got = {}
+        try:
+            for entry in self.ex.client.messages.batches.results(bid):
                 if entry.result.type == "errored" and _credit_error(Exception(str(getattr(entry.result, "error", "")))):
                     self.out_of_credit = self.ex.out_of_credit = True
                 if entry.result.type != "succeeded":
@@ -255,10 +275,45 @@ class Batch:
                 self.calls += 1
                 self.input_tokens += msg.usage.input_tokens
                 self.output_tokens += msg.usage.output_tokens
-                answers[entry.custom_id] = self.ex.parse(msg)
-        print(f"batch: {len(answers)} of {len(self.requests)} pages answered"
+                got[entry.custom_id] = self.ex.parse(msg)
+        except Exception as e:
+            print(f"batch {bid}: could not fetch all answers ({type(e).__name__}: {str(e)[:120]})", flush=True)
+        print(f"batch {bid}: {len(got)} of {len(keys)} pages answered"
               + (" (the Anthropic credit ran out)" if self.out_of_credit else ""), flush=True)
-        return answers
+        return [(k, got.get(k)) for k in keys]
+
+    def wait(self, deadline: float, poll_s: float | None = None, until_any: bool = False) -> list[tuple[str, dict | None]]:
+        """Send what is left and wait: for everything, or (until_any) until something has finished.
+        At the deadline, cancel what is still running, give it a few minutes, and return None for the rest."""
+        poll_s = self.POLL_S if poll_s is None else poll_s
+        self.submit()
+        out = self.poll(force=True)
+        while self._open and not (until_any and out):
+            if time.time() > deadline:
+                out += self._give_up(poll_s)
+                break
+            time.sleep(poll_s)
+            out += self.poll(force=True)
+        return out
+
+    def _give_up(self, poll_s: float) -> list[tuple[str, dict | None]]:
+        print("batch: out of time, cancelling what is left", flush=True)
+        for bid in self._open:
+            try:
+                self.ex.client.messages.batches.cancel(bid)
+            except Exception:
+                pass
+        out, stop = [], time.time() + self.GIVE_UP_S
+        while self._open and time.time() < stop:
+            time.sleep(min(15, poll_s))
+            out += self.poll(force=True)
+        for bid in list(self._open):
+            out += [(k, None) for k in self._open.pop(bid)]
+        return out
+
+    def run(self, deadline: float, poll_s: float | None = None) -> list[tuple[str, dict | None]]:
+        """Send everything and wait for all of it."""
+        return self.wait(deadline, poll_s)
 
 
 # Words that change from day to day without the programme changing (ticket availability, "today" labels).

@@ -61,8 +61,14 @@ After that it runs by itself every Monday at 01:00 UTC. Each run only reads the 
 - **Unchanged pages** are not sent to Claude again (page cache for up to 28 days), so weekly runs cost a fraction of the first.
   "Unchanged" ignores ticket noise: sold out, few tickets left, seat counts, "today/tomorrow" labels, and lines that only moved around.
 - **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old. New productions are always read.
-- **Batch API**, in two rounds: first every schedule page, then every production page, each sent to Claude as one bundle at half price.
+- **Batch API** (half price): first every schedule page in one bundle, then production pages in small bundles sent while browsing
+  goes on. **Each site is saved as soon as its own pages are answered**, so a job that is stopped part way keeps every site it finished.
   If a bundle is not answered in time, those schedule pages are read straight away at full price; production pages wait for the next run.
+- **Finding the dance programme**: when a homepage shows no dance but links to the dance programme, dance filter or calendar,
+  that page is read and becomes the site's schedule page. Programme overview pages open their show pages (one level down).
+- **Even split**: sites are dealt to the 12 jobs like cards, so every job gets the same number of sites from each tier.
+- **Safety limits**: every job finishes within 320 minutes (GitHub stops jobs at 355). A page that freezes the browser for
+  5 minutes is abandoned and the browser restarted, so one bad site cannot stall a job.
 - **Credit runs out**: the run stops sending pages, saves everything found so far, and says so at the top of the report.
   Sources not finished stay due, so the next run picks them up. A run started with no credit stops at once with a clear message.
 - **Tiers 2 and 3** read at most 15 production pages per site (tiers 0 and 1: 40).

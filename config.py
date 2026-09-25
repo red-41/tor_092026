@@ -20,9 +20,12 @@ DETAIL_CAP = {0: MAX_DETAIL_PAGES, 1: MAX_DETAIL_PAGES, 2: 15, 3: 15}  # tiers 2
 DETAIL_REFRESH_DAYS = 30        # a production page already read is re-read at most monthly...
 DETAIL_SOON_DAYS = 28           # ...or weekly-ish once its next show is less than 4 weeks away (cancellations, times)
 USE_BATCH = os.environ.get("USE_BATCH", "1") != "0"   # production pages go through the half-price Batch API
-JOB_MINUTES = float(os.environ.get("JOB_MINUTES", "340"))  # stop waiting for the batch before GitHub's 6-hour limit
-LISTING_BATCH_MINUTES = 150     # round 1: wait for the schedule-page batch until this many minutes into the job
-DETAIL_RESERVE_MINUTES = 60     # round 2: stop opening production pages this long before the end, so their batch can finish
+JOB_MINUTES = float(os.environ.get("JOB_MINUTES", "320"))  # everything stops by then: well inside GitHub's 355-minute job limit
+LISTING_BATCH_MINUTES = 120     # round 1: wait for the schedule-page batch until this many minutes into the job
+DETAIL_RESERVE_MINUTES = 45     # round 2: no page is opened in the last 45 minutes, so the last answers can come back
+BATCH_SEND_AT = 40              # production pages are sent to Claude in bundles of about this size...
+BATCH_SEND_EVERY_S = 600        # ...or every 10 minutes, whichever comes first, so sites are saved as they finish
+PAGE_HARD_LIMIT_S = 300         # a page still loading after 5 minutes has frozen the browser: it is restarted
 PAGE_TEXT_LIMIT = int(os.environ.get("PAGE_TEXT_LIMIT", "60000"))   # characters sent to the model per page
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2.0"))       # politeness delay between page loads
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "45000"))

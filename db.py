@@ -32,9 +32,41 @@ ACTIVE = "todo,ok,partial,failed,waiting,blocked"
 
 
 def _shard(rows: list[dict], shard: int, shards: int) -> list[dict]:
+    """Spread-by-hash split (used for the preflight check of every source)."""
     if shards <= 1:
         return rows
     return [s for s in rows if int(hashlib.md5(s["id"].encode()).hexdigest(), 16) % shards == shard]
+
+
+def _deal(rows: list[dict], shard: int, shards: int, also: list[dict] = ()) -> list[dict]:
+    """Deal sources round-robin, like cards, so every job gets the same number (by tier).
+    `also` are sources checked in the last hours: no longer due, but kept in the deal so a job that starts a little
+    later than the others still deals exactly the same hands."""
+    if shards <= 1:
+        return rows
+    deck = {r["id"]: r for r in list(also) + list(rows)}
+    order = sorted(deck.values(), key=lambda r: (9 if r.get("priority") is None else r["priority"], r["id"]))
+    mine = {r["id"] for i, r in enumerate(order) if i % shards == shard}
+    return [r for r in rows if r["id"] in mine]
+
+
+def _recently_checked(c: httpx.Client, hours: float, priority: int | None, name: str | None) -> list[dict]:
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).isoformat()
+    r = c.get("/source_checks", params={"select": "source_id", "kind": "eq.collect", "checked_at": f"gte.{since}",
+                                        "limit": "5000"})
+    r.raise_for_status()
+    ids = sorted({x["source_id"] for x in r.json() if x.get("source_id")})
+    rows = []
+    for i in range(0, len(ids), 150):
+        params = {"select": "id,priority,name", "id": f"in.({','.join(ids[i:i + 150])})"}
+        if priority is not None:
+            params["priority"] = f"eq.{priority}"
+        if name:
+            params["name"] = f"ilike.*{name}*"
+        r = c.get("/sources", params=params)
+        r.raise_for_status()
+        rows += r.json()
+    return rows
 
 
 def due_sources(limit: int, priority: int | None = None, name: str | None = None,
@@ -62,7 +94,8 @@ def due_sources(limit: int, priority: int | None = None, name: str | None = None
         r = c.get("/sources", params=params)
         r.raise_for_status()
         rows = r.json()
-    return _shard(rows, shard, shards)[:limit]
+        also = [] if shards <= 1 or status else _recently_checked(c, 6, priority, name)
+    return _deal(rows, shard, shards, also)[:limit]
 
 
 def all_sources(name: str | None = None, shard: int = 0, shards: int = 1) -> list[dict]:
