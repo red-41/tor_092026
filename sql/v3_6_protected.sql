@@ -44,3 +44,17 @@ begin
   update duplicate_review set status = 'applied', decided_at = now() where review_run = p_run and status = 'approved';
 end $function$;
 revoke execute on function public.apply_duplicate_review(text) from anon, authenticated;
+
+-- (v3_6b) the API gateway refuses a DELETE without WHERE: recompute_performance clears its scratch table with "where true".
+-- (v3_6c) one clear same-time match among other sessions of the day is taken as the match instead of being held.
+do $$
+declare d text;
+begin
+  d := pg_get_functiondef('public.promote_staging_performances(boolean, integer, timestamptz, bigint, boolean)'::regprocedure);
+  if position('v_nstrong' in d) > 0 then return; end if;
+  d := replace(d, 'v_strong uuid;', 'v_strong uuid; v_nstrong int;');
+  d := replace(d, 'into v_cands, v_strong', ', count(*) filter (where c.strong) into v_cands, v_strong, v_nstrong');
+  d := replace(d, 'if v_strong is not null and cardinality(v_cands) = 1 then',
+                  'if v_strong is not null and (cardinality(v_cands) = 1 or v_nstrong = 1) then   -- one clear match among other sessions');
+  execute d;
+end $$;
