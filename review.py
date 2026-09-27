@@ -64,6 +64,8 @@ name or a stale time when the host venue's own page says otherwise, or a listing
 performance. If the listings only word the same place differently, or both could be right, answer dismiss.
 
 Use only the evidence given. If it does not settle the question, answer "unsure" and say what is missing.
+If the pages show that neither row is a real performance (for example no show at all at that date or time), answer
+"unsure" and say so plainly: a person will remove the wrong rows. Never answer "different" in that case.
 Confidence is your probability that the verdict is right. Always answer by calling record_verdict."""
 
 TOOL = {
