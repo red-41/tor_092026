@@ -27,6 +27,14 @@ BATCH_SEND_AT = 40              # production pages are sent to Claude in bundles
 BATCH_SEND_EVERY_S = 600        # ...or every 10 minutes, whichever comes first, so sites are saved as they finish
 PAGE_HARD_LIMIT_S = 300         # a page still loading after 5 minutes has frozen the browser: it is restarted
 PAGE_TEXT_LIMIT = int(os.environ.get("PAGE_TEXT_LIMIT", "60000"))   # characters sent to the model per page
+FEED_TEXT_LIMIT = 8000          # characters of each background data feed sent along (up to 3 per page)
+SITEMAP_LIMIT = 200             # event/production addresses from a site's sitemap sent with its first schedule page
+# Tiers 0 and 1 get the thorough treatment: all calendar months to the season's end, sitemap, date hunt.
+CORE_TIERS = (0, 1)
+MAX_LISTING_PAGES_CORE = 14     # schedule pages per source for tiers 0-1 (a season is up to 12 months)
+MONTHS_AHEAD = 12
+HUNT_PAGES = 10                 # extra pages per source to find the individual dates of a run (tiers 0-1)
+MAX_EXTRA_START_PAGES = 6       # other dance categories / calendars remembered per source
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2.0"))       # politeness delay between page loads
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "45000"))
 MAX_SOURCE_MINUTES = float(os.environ.get("MAX_SOURCE_MINUTES", "25"))  # per source, so one huge site cannot eat the run

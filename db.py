@@ -1,8 +1,8 @@
 """Small Supabase REST client (PostgREST) using the service key.
 
-Only three things are written: rows in import_staging_performances, and the
-status/next-check fields of sources. Live tables are changed only by the
-database function promote_staging_performances().
+The collector writes only rows in import_staging_performances and the
+status/next-check fields of sources. Live tables are changed only by database
+functions, called from review.py: promote_staging_performances() and apply_review().
 """
 import datetime as dt
 import hashlib
@@ -110,10 +110,15 @@ def all_sources(name: str | None = None, shard: int = 0, shards: int = 1) -> lis
 
 
 def upcoming_count(source_id: str) -> int | None:
-    """How many future performances from this source are already on the site."""
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    """How many future performances this site accounts for: what it lists (even when another site's row is the
+    one shown), what plays on its own stages and its company's shows (view source_coverage). Counting only rows
+    credited to the site undercounted venues whose shows were first found on a company or festival site."""
     try:
         with _client() as c:
+            r = c.get("/source_coverage", params={"select": "total", "source_id": f"eq.{source_id}"})
+            if r.status_code < 400 and r.json():
+                return int(r.json()[0]["total"])
+            now = dt.datetime.now(dt.timezone.utc).isoformat()       # older database without the view
             r = c.get("/performances", params={"select": "id", "source_id": f"eq.{source_id}",
                                                "performance_date": f"gte.{now}"},
                       headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"})
@@ -123,6 +128,15 @@ def upcoming_count(source_id: str) -> int | None:
             return int(total) if total.isdigit() else None
     except Exception:
         return None
+
+
+def rpc(name: str, params: dict | None = None, timeout: float = 600):
+    """Call a database function and return its result."""
+    with _client() as c:
+        r = c.post(f"/rpc/{name}", json=params or {}, timeout=timeout)
+        if r.status_code >= 400:
+            raise RuntimeError(f"{name}: {r.status_code} {r.text[:500]}")
+        return r.json() if r.content else None
 
 
 def cache_get(url: str, role: str, text_hash: str, model: str, max_age_days: int = 28) -> dict | None:
@@ -209,3 +223,15 @@ def stage(rows: list[dict]) -> int:
                    headers={"Prefer": "resolution=ignore-duplicates,return=minimal"})
         r.raise_for_status()
     return len(rows)
+
+
+def upsert_runs(rows: list[dict]) -> None:
+    """Runs with missing dates (production_runs), keyed by run_key. Never stops the run if it fails."""
+    if not rows:
+        return
+    try:
+        with _client() as c:
+            c.post("/production_runs", params={"on_conflict": "run_key"}, json=rows,
+                   headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
+    except Exception:
+        pass

@@ -10,8 +10,10 @@ Usage:
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -21,8 +23,9 @@ from zoneinfo import ZoneInfo
 
 import config
 import db
+import lenses
 from browse import Browser
-from extract import Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash
+from extract import Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash, runs_of, time_seen
 
 THIN = 150          # characters: below this a page has nothing to read
 
@@ -64,10 +67,17 @@ def reusable(prev: dict | None, today: dt.date) -> bool:
             pass
     if not dates:
         return False                      # no dates known yet: look again, they may be out now
+    if runs_of(prev["result"]) or _short_of_expected(prev["result"]):
+        return False                      # some dates were missing last time: look again, they may be out now
     future = [d for d in dates if d >= today]
     if not future:
         return True                       # the run is over
     return min(future) > today + dt.timedelta(days=config.DETAIL_SOON_DAYS)
+
+
+def _short_of_expected(data: dict) -> bool:
+    exp = data.get("expected_performances")
+    return isinstance(exp, int) and exp > len({(p.get("date"), p.get("time")) for p in flatten(data)})
 
 
 def _skip_reason(snap) -> str:
@@ -83,23 +93,83 @@ def _skip_reason(snap) -> str:
 def apply_detail(result: dict, data: dict, snap, url: str) -> None:
     """Add the performances from one production page to a source's result.
     If the 'production page' turned out to be an overview (a ballet programme listing its shows), its show pages
-    are opened too, one level deep."""
+    are opened too, one level deep. Runs with missing dates start a date hunt (tiers 0-1)."""
     st = result["_state"]
     today = st["today"]
+    lens = st["hunt"].get(url)                  # this page was opened to find a run's dates
     if data.get("notes"):
         result["notes"].append(data["notes"])
+    here = []
     for p in flatten(data):
         c = clean_performance(p, today)
         if c:
+            c["time_seen"] = time_seen(c["time"], getattr(snap, "text", "") or "")
             c["image_url"] = c["image_url"] or (snap.og_image if snap else None) or None
             c["ticket_url"] = c["ticket_url"] or (snap.final_url if snap else url)
+            if lens and c["date_source"] == "listed":
+                c["date_source"] = lens
             result["items"].append(c)
+            here.append(c)
+    runs = runs_of(data)
+    expected = data.get("expected_performances")
+    if not runs and isinstance(expected, int) and here and len({(c["date"], c["time"]) for c in here}) < expected:
+        first = here[0]                          # count check: fewer dates found than the page announces
+        runs = [{"title": first["title"], "work": first["work"], "company": first["company"],
+                 "choreographer": first["choreographer"], "image_url": first["image_url"], "description": first["description"],
+                 "detail_url": url, "venue": first["venue"], "city": first["city"], "country": first["country"],
+                 "start": min(c["date"] for c in here), "end": max(c["date"] for c in here), "expected": expected,
+                 "dates_page_url": None, "venue_event_url": None}]
+    for r in runs:
+        r["detail_url"] = r.get("detail_url") or url
+        add_run(result, r, lens or ("listing" if url == "listing" else "production page"))
+        hunt(result, r)
     if data.get("page_status") == "listing_without_dates" and url not in st["deep"]:
         new = [u for u in (data.get("detail_links") or []) if isinstance(u, str) and u not in st["details"]]
         if new:
             st["details"] += new
             st["deep"].update(new)
             st["more"] = True
+
+
+def _run_key(result: dict, r: dict) -> str:
+    return "|".join([(r.get("title") or "").lower(), (r.get("venue") or "").lower(), r.get("start") or ""])
+
+
+def add_run(result: dict, r: dict, lens: str) -> None:
+    """Remember a run with missing dates (merging the same run seen on several pages)."""
+    runs = result["_state"]["runs"]
+    key = _run_key(result, r)
+    cur = runs.get(key)
+    if cur is None:
+        runs[key] = cur = {**r, "lenses": []}
+    else:
+        for k, v in r.items():
+            if v and not cur.get(k):
+                cur[k] = v
+    if lens not in cur["lenses"]:
+        cur["lenses"].append(lens)
+
+
+def hunt(result: dict, r: dict) -> None:
+    """Date hunt (tiers 0-1): open the run's dates page and the host venue's own page, if not tried yet."""
+    st = result["_state"]
+    if not st["core"]:
+        return
+    cur = st["runs"][_run_key(result, r)]
+    for field, lens in (("dates_page_url", "booking"), ("venue_event_url", "venue_site")):
+        u = (r.get(field) or "").strip()
+        if not u.startswith("http") or lenses.is_ticket_seller(u) or u in st["visited"] or u in st["hunt"]:
+            continue
+        if st["hunts_used"] >= config.HUNT_PAGES:
+            if "hunt limit reached" not in cur["lenses"]:
+                cur["lenses"].append("hunt limit reached")
+            return
+        st["hunts_used"] += 1
+        st["hunt"][u] = lens
+        st["hunt_queue"].append(u)
+        st["more"] = True
+        if lens not in cur["lenses"]:
+            cur["lenses"].append(lens)
 
 
 def _light(snap):
@@ -123,9 +193,10 @@ def open_page(br: Browser, result: dict, url: str):
     return snap
 
 
-def handle_listing(result: dict, snap, data: dict) -> None:
+def handle_listing(result: dict, snap, data: dict, url: str | None = None) -> None:
     """Use Claude's reading of a listing page: performances, production pages to open, next pages."""
     st = result["_state"]
+    url = url or snap.final_url
     status = data.get("page_status")
     st["statuses"].append(status)
     guess = data.get("schedule_url_guess")
@@ -133,22 +204,44 @@ def handle_listing(result: dict, snap, data: dict) -> None:
         if guess not in st["visited"] and guess not in st["queue"]:
             result["schedule_url"] = guess               # the real dance programme: start there next time
             st["queue"].insert(0, guess)
+            st["origin"][guess] = "guess"
         if status == "not_a_schedule":
             return
     st["listings_read"] += 1
     if st["listings_read"] == 1 and not result["source"].get("schedule_url") and not result["schedule_url"]:
         result["schedule_url"] = snap.final_url
+    found = 0
     for p in flatten(data):
         c = clean_performance(p, st["today"])
         if c:
+            c["time_seen"] = time_seen(c["time"], getattr(snap, "text", "") or "")
             result["items"].append(c)
-    st["details"] += [u for u in data.get("detail_links", []) if isinstance(u, str) and u not in st["details"]]
-    for u in (data.get("listing_links") or [])[:3]:
-        if isinstance(u, str) and u not in st["visited"] and u not in st["queue"]:
+            st["listing_dates"].append(c["date"])
+            found += 1
+    new_details = [u for u in data.get("detail_links", []) if isinstance(u, str) and u not in st["details"]]
+    st["details"] += new_details
+    if st["origin"].get(url) == "listing_link" and (found or new_details):
+        st["learned"].append(url)                        # another dance category that pays off: keep it as a start page
+    for u in (data.get("listing_links") or [])[:4]:
+        if isinstance(u, str) and u.startswith("http") and u not in st["visited"] and u not in st["queue"]:
             st["queue"].append(u)
+            st["origin"].setdefault(u, "listing_link")
     nxt = data.get("next_page_url")
-    if nxt and nxt not in st["visited"] and nxt not in st["queue"]:
+    if isinstance(nxt, str) and nxt.startswith("http") and nxt not in st["visited"] and nxt not in st["queue"]:
         st["queue"].append(nxt)
+        st["origin"].setdefault(nxt, "next")
+        st["paged"] = True
+        if st["core"] and not st["months_queued"]:        # a calendar by month: jump to every month of the season
+            months = [m for m in lenses.month_series(nxt, st["today"], config.MONTHS_AHEAD)
+                      if m not in st["visited"] and m not in st["queue"]]
+            if months:
+                st["months_queued"] = True
+                st["queue"] += months
+                for m in months:
+                    st["origin"][m] = "month"
+    for r in runs_of(data):
+        add_run(result, r, "listing")
+        hunt(result, r)
     if data.get("notes"):
         result["notes"].append(data["notes"])
 
@@ -163,12 +256,24 @@ def start_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = Tru
                          "out_of_time": False, "details": [], "deep": set(), "more": False, "visited": set(),
                          "queue": [], "first": None, "browse_s": 0.0,
                          "venues": db.known_venues(source.get("country")),
-                         "cap": config.DETAIL_CAP.get(2 if prio is None else prio, config.MAX_DETAIL_PAGES)}}
+                         "cap": config.DETAIL_CAP.get(2 if prio is None else prio, config.MAX_DETAIL_PAGES),
+                         "core": prio in config.CORE_TIERS, "origin": {}, "learned": [], "listing_dates": [],
+                         "paged": False, "months_queued": False, "runs": {}, "hunt": {}, "hunt_queue": [],
+                         "hunts_used": 0}}
     st = result["_state"]
     t0 = time.monotonic()
     start = source.get("schedule_url") or source.get("website")
     st["visited"].add(start)
+    for u in (source.get("extra_schedule_urls") or [])[: config.MAX_EXTRA_START_PAGES]:
+        if u and u != start and u not in st["queue"]:
+            st["queue"].append(u)                         # other dance categories / calendars learned before
+            st["origin"][u] = "extra"
     snap = open_page(br, result, start)
+    if snap and st["core"] and hasattr(br, "sitemap"):
+        try:
+            snap.sitemap = br.sitemap(snap.final_url, config.SITEMAP_LIMIT)
+        except Exception:
+            snap.sitemap = []
     if snap:
         st["readable"] += 1
         h = page_hash(snap)
@@ -206,10 +311,11 @@ def continue_source(br: Browser, ex: Extractor, result: dict, use_cache: bool = 
         if data is None:                                    # the batch gave no answer: read it now
             data = read_page(ex, snap, source, venues, LISTING, use_cache)
         st["first"] = None
-        handle_listing(result, snap, data)
+        handle_listing(result, snap, data, source.get("schedule_url") or source.get("website"))
 
-    # further listing pages (the dance programme, pagination, next months): answered straight away
-    while queue and result["pages"] < config.MAX_LISTING_PAGES:
+    # further listing pages (the dance programme, other categories, pagination, next months): answered straight away
+    max_listing = config.MAX_LISTING_PAGES_CORE if st["core"] else config.MAX_LISTING_PAGES
+    while queue and result["pages"] < max_listing:
         if stop_at and time.time() > stop_at:
             break
         url = queue.pop(0)
@@ -220,7 +326,7 @@ def continue_source(br: Browser, ex: Extractor, result: dict, use_cache: bool = 
         if not snap:
             continue
         st["readable"] += 1
-        handle_listing(result, snap, read_page(ex, snap, source, venues, LISTING, use_cache))
+        handle_listing(result, snap, read_page(ex, snap, source, venues, LISTING, use_cache), url)
     _spent(result, t0)
     open_details(br, ex, result, use_cache, batch, stop_at)
     return result
@@ -234,11 +340,11 @@ def open_details(br: Browser, ex: Extractor, result: dict, use_cache: bool = Tru
     t0 = time.monotonic()
     try:
         while True:
-            todo = [u for u in st["details"][: st["cap"]] if u not in st["visited"]]
+            todo = [u for u in st["details"][: st["cap"]] + st["hunt_queue"] if u not in st["visited"]]
             if not todo:
                 return
             for url in todo:
-                if use_cache:
+                if use_cache and url not in st["hunt"]:
                     prev = db.cache_peek(url, DETAIL)
                     if reusable(prev, st["today"]):      # read before, next show not soon: no need to open it
                         st["visited"].add(url)
@@ -308,7 +414,56 @@ def finalize(result: dict) -> dict:
         if result["status"] == "no_dance":
             result["status"] = "failed"
     result["read_method"] = "detail_pages" if details else ("paged_list" if result["pages"] > 1 else "single_page")
+    result["runs"] = settle_runs(result)
+    result["coverage"] = coverage_checks(result)
+    at = 1 if result["check"] else 0             # the "found far fewer" warning stays first
+    for c in reversed(result["coverage"]):
+        result["notes"].insert(at, c)
     return result
+
+
+def _same_place(a: str | None, b: str | None) -> bool:
+    a, b = (a or "").lower().strip(), (b or "").lower().strip()
+    return not a or not b or a == b or a in b or b in a
+
+
+def settle_runs(result: dict) -> list[dict]:
+    """How complete each run with missing dates is now, after all lenses: complete, partial or range_only."""
+    out = []
+    for r in result["_state"]["runs"].values():
+        title, work = (r.get("title") or "").lower(), (r.get("work") or "").lower()
+        dates = {(it["date"], it["time"]) for it in result["items"]
+                 if ((it["title"] or "").lower() == title or (work and (it["work"] or "").lower() == work))
+                 and _same_place(it["venue"], r.get("venue"))
+                 and (not r.get("start") or it["date"] >= r["start"]) and (not r.get("end") or it["date"] <= r["end"])}
+        via_hunt = any(it.get("date_source") in ("booking", "venue_site") for it in result["items"]
+                       if (it["title"] or "").lower() == title and _same_place(it["venue"], r.get("venue")))
+        exp, found = r.get("expected"), len(dates)
+        if exp and found >= exp:
+            status = "complete"
+        elif found <= 1:
+            status = "range_only"
+        elif not exp and via_hunt and found >= 2:
+            status = "complete"
+        else:
+            status = "partial"
+        out.append({**r, "found": found, "status": status})
+    return out
+
+
+def coverage_checks(result: dict) -> list[str]:
+    """Signs that part of a site's programme was not reached."""
+    st, source, out = result["_state"], result["source"], []
+    ld = sorted(st["listing_dates"])
+    if len(ld) >= 3 and not st["paged"] and not st["details"]:
+        span = (dt.date.fromisoformat(ld[-1]) - dt.date.fromisoformat(ld[0])).days
+        if span <= 35:
+            out.append(f"CHECK: the schedule showed only {ld[0]} to {ld[-1]}; the calendar may show one month at a time")
+    if st["core"] and result["items"] and re.search(r"(opera|ballet|theatre|theater)", source.get("kind") or "", re.I):
+        last = max(it["date"] for it in result["items"])
+        if dt.date.fromisoformat(last) < st["today"] + dt.timedelta(days=75):
+            out.append(f"CHECK: dates found only up to {last}; the rest of the season may not have been reached")
+    return out
 
 
 def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
@@ -336,43 +491,94 @@ def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
     return touched
 
 
+MULTI_ZONE = {"United States", "USA", "Canada", "Australia", "Russia", "Brazil", "Mexico"}
+IBERIA = {"Spain": "Europe/Madrid", "Portugal": "Europe/Lisbon"}
+
+
+def _offset(tz: str, date: str | None):
+    try:
+        day = dt.datetime.fromisoformat((date or dt.date.today().isoformat()) + "T20:00")
+        return day.replace(tzinfo=ZoneInfo(tz)).utcoffset()
+    except Exception:
+        return None
+
+
 def _timezone(item: dict, source: dict) -> str | None:
-    """The venue's time zone: from the performance's country when it is abroad, else the source's."""
+    """The venue's time zone: as read with the date, else from its country when abroad, else the source's.
+    A zone read with the date that does not fit the date's country is replaced by the country's zone (a Lisbon
+    company's show in Madrid was read with Lisbon time, which put it an hour off)."""
     country = (item.get("country") or "").strip()
-    if country and country != source.get("country"):
-        tz = config.TZ_BY_COUNTRY.get(country)
-        if tz:
-            return tz
+    by_country = config.TZ_BY_COUNTRY.get(country)
+    own = item.get("timezone")
+    if own:
+        if country in IBERIA:
+            # mainland Spain and Portugal differ by an hour; the islands keep their own zone
+            return IBERIA[country] if own in IBERIA.values() else own
+        if by_country and country not in MULTI_ZONE and _offset(own, item.get("date")) != _offset(by_country, item.get("date")):
+            return by_country
+        return own
+    if country and country != source.get("country") and by_country:
+        return by_country
     return source.get("timezone")
 
 
-def recheck_days(source: dict, found: int) -> int:
+def recheck_days(source: dict, found: int, runs: list | None = None, today: dt.date | None = None) -> int:
     p = source.get("priority")
     days = config.RECHECK_DAYS.get(2 if p is None else p, 14)
     if source.get("kind") == "Festival" and found == 0:
         days = max(days, config.FESTIVAL_WAIT_DAYS)
+    today = today or dt.date.today()
+    soon = [r for r in (runs or []) if r["status"] != "complete" and r.get("start")
+            and dt.date.fromisoformat(r["start"]) <= today + dt.timedelta(days=60)]
+    if soon and p in config.CORE_TIERS:
+        days = min(days, 7)                     # dates of a run opening soon are usually published in the last weeks
     return days
+
+
+def _is_venue(source: dict) -> bool:
+    return not re.search(r"(company|festival|competition)", source.get("kind") or "", re.I)
 
 
 def to_staging(result: dict, run_date: str) -> list[dict]:
     s = result["source"]
     host = urlparse(s.get("website") or "").netloc
+    venue_source = _is_venue(s)
     rows = []
     for it in result["items"]:
+        # a venue's own shows may leave out the city; a company's or festival's never borrow its home city
+        home = venue_source and not it["venue"]
         rows.append({
             "source_id": s["id"], "source": host,
             "title": it["title"], "original_title": it["original_title"],
             "work": it["work"], "work_is_story": it["work_is_story"],
             "choreographer": it["choreographer"], "company": it["company"],
-            "venue": it["venue"], "city": it["city"] or s.get("city"), "country": it["country"] or s.get("country"),
+            "venue": it["venue"],
+            "city": it["city"] or (s.get("city") if home or (venue_source and not it["country"]) else None),
+            "country": it["country"] or (s.get("country") if venue_source or not it["city"] else None),
             "timezone": _timezone(it, s),
             "performance_date": it["date"], "performance_time": it["time"], "time_tbc": it["time"] is None,
             "tags": it["tags"], "genre": it["tags"][0],
             "program": it["program"], "program_position": it["program_position"],
             "tickets_url": it["ticket_url"], "image_url": it["image_url"], "description": it["description"],
-            "cancelled": it["cancelled"],
+            "cancelled": it["cancelled"], "date_source": it.get("date_source") or "listed",
             "dedupe_key": db.dedupe_key(host, it, run_date), "status": "pending",
         })
+    return rows
+
+
+def run_rows(result: dict) -> list[dict]:
+    s = result["source"]
+    rows = []
+    for r in result.get("runs") or []:
+        key = hashlib.md5("|".join([s["id"], (r.get("title") or "").lower(), (r.get("venue") or "").lower(),
+                                    r.get("start") or ""]).encode()).hexdigest()
+        rows.append({"run_key": key, "source_id": s["id"], "detail_url": r.get("detail_url"), "title": r["title"],
+                     "work": r.get("work"), "company": r.get("company"), "choreographer": r.get("choreographer"),
+                     "venue": r.get("venue"), "city": r.get("city"), "country": r.get("country"),
+                     "run_start": r.get("start"), "run_end": r.get("end"), "expected_count": r.get("expected"),
+                     "found_count": r["found"], "status": r["status"], "lenses_tried": r.get("lenses") or [],
+                     "dates_page_url": r.get("dates_page_url"), "image_url": r.get("image_url"),
+                     "description": r.get("description")})
     return rows
 
 
@@ -510,7 +716,7 @@ def save(res: dict, args, run_date: str) -> dict:
     s = res["source"]
     rows = to_staging(res, run_date)
     staged = 0 if args.dry else db.stage(rows)
-    days = 0 if res.get("retry_soon") else recheck_days(s, len(rows))    # credit ran out: due again straight away
+    days = 0 if res.get("retry_soon") else recheck_days(s, len(rows), res.get("runs"), res["_state"]["today"])
     fields = {
         "status": res["status"],
         "next_check_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).isoformat(),
@@ -520,6 +726,12 @@ def save(res: dict, args, run_date: str) -> dict:
     }
     if res["schedule_url"] and not s.get("schedule_url"):
         fields["schedule_url"] = res["schedule_url"]
+    learned = [u for u in res["_state"]["learned"] if u not in (s.get("extra_schedule_urls") or [])]
+    if learned:
+        fields["extra_schedule_urls"] = ((s.get("extra_schedule_urls") or []) + learned)[: config.MAX_EXTRA_START_PAGES]
+    runs = run_rows(res)
+    if runs and not args.dry:
+        db.upsert_runs(runs)
     if not s.get("read_method"):
         fields["read_method"] = res["read_method"]
     if not args.dry:
@@ -528,7 +740,11 @@ def save(res: dict, args, run_date: str) -> dict:
              "pages": res["pages"], "reused": res.get("reused", 0), "check": res["check"],
              "upcoming_before": res.get("upcoming_before"), "blocked": sorted(set(res["blocked"])),
              "cookies": sorted(set(res["cookies"])), "screens": res["screens"][:5],
-             "minutes": res.get("minutes", 0), "notes": res["notes"][:4]}
+             "minutes": res.get("minutes", 0), "notes": res["notes"][:4], "coverage": res.get("coverage", []),
+             "runs": [{"title": r["title"], "venue": r.get("venue"), "start": r.get("start"), "end": r.get("end"),
+                       "found": r["found"], "expected": r.get("expected"), "status": r["status"],
+                       "lenses": r.get("lenses") or []} for r in res.get("runs") or []],
+             "learned": learned}
     _record(s, entry, args)
     return entry
 
@@ -565,7 +781,7 @@ def write_report(report, ex, args, batches=(), credit_out=False):
     for r in report:
         by[r["status"]] = by.get(r["status"], 0) + 1
     total = sum(r["performances"] for r in report)
-    problems = [r for r in report if r["status"] in ("blocked", "failed") or r["check"]]
+    problems = [r for r in report if r["status"] in ("blocked", "failed") or r["check"] or r.get("coverage")]
     b_calls = sum(b.calls for b in batches)
     b_in = sum(b.input_tokens for b in batches)
     b_out = sum(b.output_tokens for b in batches)
@@ -585,6 +801,21 @@ def write_report(report, ex, args, batches=(), credit_out=False):
             why = "; ".join(r["notes"]).replace("|", "/")[:220]
             lines.append(f"| {r['source']} | {r['status']} | {r['performances']} | {r.get('upcoming_before') or 0} | {why} |")
         lines.append("")
+    open_runs = [(r["source"], x) for r in report for x in r.get("runs") or [] if x["status"] != "complete"]
+    solved = sum(1 for r in report for x in r.get("runs") or [] if x["status"] == "complete")
+    if open_runs or solved:
+        lines += ["### Date hunt", f"{solved} runs completed by the date hunt; {len(open_runs)} still without all dates "
+                  "(shown on the site as a date range until the dates appear).", "",
+                  "| Source | Production | Venue | Run | Dates found | Looked at |", "|---|---|---|---|---|---|"]
+        for src, x in open_runs[:60]:
+            found = f"{x['found']} of {x['expected']}" if x.get("expected") else str(x["found"])
+            lines.append(f"| {src} | {x['title']} | {x.get('venue') or '?'} | {x.get('start') or '?'} to {x.get('end') or '?'} | "
+                         f"{found} | {', '.join(x['lenses']) or '-'} |")
+        lines.append("")
+    learned = [(r["source"], u) for r in report for u in r.get("learned") or []]
+    if learned:
+        lines += ["### New start pages learned", "Dance categories or calendars found this run that will be read every time from now on:", ""]
+        lines += [f"- {src}: {u}" for src, u in learned] + [""]
     lines += ["### All sources", "| Source | Status | Found | Pages | Cookie banner | Minutes | Notes |",
               "|---|---|---|---|---|---|---|"]
     for r in report:

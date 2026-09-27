@@ -1,11 +1,41 @@
 # Saffitt collector
 
-Reads the dance and ballet schedules of every website in the Saffitt `sources` table and puts the performances into the staging table. A nightly job inside Supabase then moves them onto the site.
+Reads the dance and ballet schedules of every website in the Saffitt `sources` table, puts the performances into the staging table, then publishes them with a duplicate check in between.
 
 ```
-sources table ──> GitHub Actions (weekly, 12 in parallel) ──> import_staging_performances ──> promote_staging_performances() ──> performances
-                   headless browser + Claude reads pages                                   (nightly, inside Supabase)
+sources ──> collect (12 jobs in parallel) ──> import_staging_performances ──> publish (review.py) ──> performances
+            headless browser + Claude                                          matching, duplicate check,   + performance_sources
+            reads pages                                                        Claude reviews unsure cases    (one row per site)
 ```
+
+## One performance, many websites
+
+The same show is often listed by the host theatre, a festival and the touring company. It is published once, and every
+website that lists it is kept as a **listing** in `performance_sources`. What the site shows is chosen by precedence:
+
+1. the host venue's own website, when it is a tier 0 site and the show is on one of its own stages (`source_venues`)
+2. a festival
+3. the company's own website
+4. a venue below tier 0 on its own stage
+5. any other site
+
+Venue, date, time and ticket link come from the best listing that gives them; a listing with a time beats one without.
+Shows outside Europe by tier 0 companies, choreographers or venues are kept.
+
+## Publishing and the duplicate check (`review.py`, job **publish**)
+
+Runs after the collect jobs (or alone: mode **review**).
+1. **Publish.** Each staging row is matched against what is on the site: same venue and start; same show under a
+   slightly different title; one site without a venue; and the same show in the same city and day under another venue
+   name (a festival calling the Old Stage "Royal Danish Theatre"). A clear match becomes one more listing of that show.
+   A possible match is **held** (`match_review`) instead of being published as a second row. A copy of a date without its
+   venue that the same site also gives complete is dropped.
+2. **Look for pairs** among published shows that may be the same performance (`find_duplicate_candidates`).
+3. **Claude reviews** every held row, pair and disagreement between trusted sites (`performance_conflicts`), with what each
+   site says and the text of the listing pages. It answers same / different, which row to keep, or which listing is wrong.
+4. **Only confident answers are applied** (confidence 0.85 or more; variable `REVIEW_MIN_CONFIDENCE`). A merge moves every
+   listing to the kept row and snapshots the removed one in `duplicate_review`. Everything else stays open with Claude's
+   reasoning, for a person: `select * from review_queue();`
 
 ## What it does for each website
 
@@ -15,9 +45,38 @@ sources table ──> GitHub Actions (weekly, 12 in parallel) ──> import_sta
 4. If a source has no schedule page yet, it starts from the home page and finds it, then saves it in `sources.schedule_url`.
 5. Writes the rows to `import_staging_performances` and updates the source: status (ok, partial, waiting, no_dance, failed), a short note, and when it is due again (tier 0, the core, every 7 days; tier 1 every 14; tiers 2 and 3 every 30; a festival with no programme out yet every 30).
 
-It never writes to `performances`, `theaters`, `companies` or `choreographers` directly. Those change only when `promote_staging_performances()` runs, which updates existing rows in place and never deletes.
+The collect jobs never write to `performances`, `theaters`, `companies` or `choreographers`. Those change only in the
+publish step, through database functions: `promote_staging_performances()` adds rows and listings, `apply_review()` applies
+a review verdict. A row is removed only when the review finds it is a duplicate, and the removed row is kept as a snapshot.
 
 It respects each site's robots.txt and waits 2 seconds between page loads.
+
+## Finding every date (tiers 0 and 1)
+
+The core sites get a more thorough treatment. Each lens looks for dates the schedule page does not show directly:
+
+- **Calendars by month**: when the next-month link has a pattern (`?month=2026-11`, `/2026/11/`, `?luna=11&anul=2026`),
+  every month up to 12 ahead is opened directly (up to 14 schedule pages).
+- **Background data**: booking widgets and JavaScript calendars load their dates as data. That data is kept and read with
+  the page; a feed asked for one week (`from=...&to=...`) is asked again for the whole season.
+- **Calendar files**: "add to calendar" (.ics) files are read directly, no model needed.
+- **Buttons**: in-page "Dates", "Sessions", "Termine", "Séances"... buttons and tabs are clicked; collapsed sections opened.
+- **Sitemap**: the site's sitemap.xml gives its current production pages; the dance ones are opened even if no calendar shows them.
+- **Several dance categories**: Claude lists every other dance-related category or filter (ballet, dance, guest performances,
+  family dance). One that produces shows is remembered in `sources.extra_schedule_urls` and read every time.
+- **Date hunt**: when a production shows only a range ("2 Dec to 2 Jan") or fewer dates than it announces ("12 performances"),
+  the collector opens the production's own dates or booking page, and for a touring stop the host venue's own page.
+  Third-party ticket sellers are never used. Runs still missing dates are saved in `production_runs` with where it looked,
+  shown on the site as a date range, and looked at again at every visit (weekly once the opening is within 60 days).
+- **Never invented**: dates are only taken as written. A weekly pattern stated on the page ("Thu and Fri 20:30") is the only
+  case where dates are worked out, and those are marked as such.
+- **Touring**: every date keeps its own venue, city, country and time zone, including small "on tour" / "Gastspiel" marks.
+  A company's or festival's home city is never filled in for a date that names another place.
+- **Coverage checks** in the report: a schedule that showed only one month, or dates that stop well before the season ends.
+
+Checks inside Supabase (no cost): `company_venue_mismatches` (a company lists a show its venue does not, or the reverse),
+`plausibility_flags` (odd local start times, a company in two cities at once, shows without venue),
+`suggested_new_sources` (venues and companies we keep meeting but do not collect yet), `upcoming_runs_without_dates`.
 
 ## One-time setup (about 10 minutes)
 
@@ -38,16 +97,11 @@ It respects each site's robots.txt and waits 2 seconds between page loads.
    It opens every source exactly as the collector would, with no Claude, and reports per site (also saved in the Supabase table `source_checks`, so Claude can review it there):
    OK, NO DATES (home page; the collector will find the schedule), EMPTY, BLOCKED (and by what: Cloudflare, captcha, 403...),
    ERROR, or ROBOTS, plus what happened to the cookie banner. Download **all-results** for a spreadsheet of every site and a screenshot of each page.
-2. **Collect.** Run workflow > mode **collect**. This writes only to the staging table, never to the live site.
-3. **Check the staging rows** (or ask Claude to): `select * from promote_staging_performances(dry_run => true);`
-4. **Then switch on the nightly move-in**, once, in the Supabase SQL Editor:
-   ```sql
-   create extension if not exists pg_cron;
-   select cron.schedule('promote-staging-nightly', '0 3 * * *',
-     $$select count(*) from promote_staging_performances()$$);
-   ```
+2. **Collect with `dry` ticked** first: it reads and reports, writes nothing, and the publish job is skipped.
+3. **Collect.** Run workflow > mode **collect**. The collect jobs write to the staging table; the publish job then
+   publishes with the duplicate check. To only preview publishing: `select * from promote_staging_performances(dry_run => true);`
 
-After that it runs by itself every Monday at 01:00 UTC. Each run only reads the sources that are due.
+After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC. Each run only reads the sources that are due.
 
 ## What protects the data
 
@@ -57,7 +111,8 @@ After that it runs by itself every Monday at 01:00 UTC. Each run only reads the 
 - **Cookie banners**: it refuses them (20+ consent tools recognised, also inside iframes, button wording in 14 languages).
   It accepts only when the site shows nothing until you do. Anything left covering the page is removed from view.
 - **Empty or thin pages** get a second, longer wait for late JavaScript. Pages with nothing on them are not sent to Claude.
-- **Suspiciously few results**: if a site gives less than half of what is already on Saffitt from that source, the report flags it (CHECK) and nothing is removed. Promotion never deletes.
+- **Suspiciously few results**: if a site gives less than half of what Saffitt already has for it (what it lists, what plays on its own stages, its company's shows: view `source_coverage`), the report flags it (CHECK) and nothing is removed.
+- **Copies inside one reading**: a date given once with its venue and once without, or twice with times exactly 1 or 2 hours apart (a UTC copy from the page's background data), is kept once: with its venue, and at the time written in the page text.
 - **Unchanged pages** are not sent to Claude again (page cache for up to 28 days), so weekly runs cost a fraction of the first.
   "Unchanged" ignores ticket noise: sold out, few tickets left, seat counts, "today/tomorrow" labels, and lines that only moved around.
 - **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old. New productions are always read.
@@ -72,7 +127,7 @@ After that it runs by itself every Monday at 01:00 UTC. Each run only reads the 
 - **Credit runs out**: the run stops sending pages, saves everything found so far, and says so at the top of the report.
   Sources not finished stay due, so the next run picks them up. A run started with no credit stops at once with a clear message.
 - **Tiers 2 and 3** read at most 15 production pages per site (tiers 0 and 1: 40).
-- **Time cap**: max 25 minutes per site, 40 production pages, 8 listing pages. The rest is picked up next run.
+- **Time cap**: max 25 minutes per site, 40 production pages, 8 listing pages (14 for tiers 0-1), 10 date-hunt pages. The rest is picked up next run.
 - **PDF schedules** are read too.
 
 ## If some sites block GitHub's servers
@@ -81,16 +136,17 @@ Some sites refuse visitors from data centres but not from homes. Those can be re
 1. Repository > Settings > Actions > Runners > **New self-hosted runner**, and follow the steps for your Mac/PC (needs Python 3).
 2. Settings > Secrets and variables > Actions > Variables > add `HOME_RUNNER` = `true`.
 
-After each weekly run, the `blocked` sites are then retried from your computer whenever it is on.
+After each weekly run, the `blocked` sites are then retried from your computer whenever it is on. What it finds is published by the next run.
 
 ## Reading the results
 
 - Each run shows a summary table per shard (source, status, performances, pages, notes) and the Claude tokens used. The same report is saved as a downloadable artifact.
 - In Supabase, `sources.status` and `sources.notes` show how each site went last time; the admin Sources page shows the same.
-- Before the nightly move-in you can preview what it would do:
-  ```sql
-  select * from promote_staging_performances(dry_run => true);
-  ```
+- The publish job's summary lists what was published and what Claude decided; the full report (each case, verdict,
+  confidence and reason) is the **review-report** artifact.
+- What still waits for a person: `select * from review_queue();`. To answer one yourself:
+  `select apply_review('pair', 123, 'different');`, `select apply_review('held', 8685, 'same', '<performance id>');`,
+  `select apply_review('conflict', 4, 'ignore_listings', null, array[5678]);`
 
 ## Running by hand
 

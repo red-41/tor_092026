@@ -4,6 +4,8 @@ and return its text, links and event data. Also tells blocked pages apart from e
 What it does NOT do: solve captchas, fake a human, or rotate IP addresses. If a site
 actively refuses automated visitors, the page is reported as blocked and skipped.
 """
+import datetime as dt
+import gzip
 import io
 import json
 import re
@@ -18,6 +20,7 @@ from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 import config
+import lenses
 
 # ---------------------------------------------------------------- cookie banners
 # Consent managers seen on European venue sites: their "reject" / "only necessary" buttons.
@@ -107,8 +110,23 @@ BANNER_JS = """(remove) => {
 }""" % COOKIE_WORDS
 
 LOAD_MORE = re.compile(r"(load more|show more|more events|see more|view more|all dates|mehr anzeigen|weitere termine|mehr laden|"
-                       r"voir plus|afficher plus|plus de dates|meer laden|toon meer|meer tonen|mostra altri|carica altri|"
-                       r"ver más|cargar más|pokaż więcej|näytä lisää|vis flere|se flere|visa fler|načíst další)", re.I)
+                       r"voir plus|afficher plus|plus de dates|meer laden|toon meer|meer tonen|toon volgende|meer weergeven|"
+                       r"mostra altri|mostra di più|carica altri|ver más|cargar más|pokaż więcej|näytä lisää|vis flere|"
+                       r"se flere|visa fler|načíst další|zobrazit další|zobrazit více|načíst více|további|mais eventos)", re.I)
+# In-page buttons and tabs that reveal a production's individual dates (never links that leave the page).
+DATE_BUTTONS = re.compile(
+    r"^\s*(dates?|all dates|show dates|see (?:all )?dates|view (?:all )?dates|more dates|dates (?:and|&) (?:tickets|times|prices)|"
+    r"(?:all |show |view |see )?(?:sessions|performances)(?: and prices| & prices)?|showtimes|times (?:and|&) tickets|"
+    r"séances|voir les (?:dates|séances)|toutes les dates|les dates|dates et (?:tarifs|horaires)|voir plus de dates|"
+    r"termine|alle termine|termine (?:und|&) (?:tickets|karten)|spieltermine|vorstellungen|"
+    r"fechas|todas las fechas|ver fechas|funciones|date e orari|tutte le date|date|repliche|"
+    r"speeldata|alle speeldata|speeldagen|voorstellingen|forestillinger|alle forestillinger|föreställningar|spilledatoer|"
+    r"esitykset|näytökset|terminy|wszystkie terminy|termíny|všechny termíny|reprízy|előadások|időpontok|datas|sessões)"
+    r"\s*[›»>→+\-]*\s*$", re.I)
+# Hosts whose background data is never about the programme.
+NOT_PROGRAMME_HOSTS = re.compile(r"(google|gstatic|facebook|doubleclick|hotjar|cookiebot|onetrust|usercentrics|didomi|"
+                                 r"sentry|segment|matomo|piwik|clarity|tiktok|linkedin|twitter|cloudflareinsights|"
+                                 r"newrelic|nr-data|hubspot|mailchimp|recaptcha|trustpilot)", re.I)
 
 # ---------------------------------------------------------------- bot walls
 BLOCK_TITLE = re.compile(r"(just a moment|attention required|access denied|403 forbidden|forbidden|"
@@ -145,6 +163,8 @@ class Snapshot:
     blocked: str = ""           # which bot wall stopped us ("cloudflare", "captcha", "HTTP 403"...), empty if none
     cookie: str = "none"        # none | refused | accepted | hidden | banner remains
     screenshot: str = ""        # file path, when screenshots are on
+    feeds: list = field(default_factory=list)       # [{"url", "text"}] data (JSON) the page loaded in the background
+    sitemap: list = field(default_factory=list)     # event/production addresses from the site's sitemap.xml
 
 
 def _flatten_ld(node, out):
@@ -206,6 +226,15 @@ class Robots:
             self._cache[root] = rp
         return self._cache[root].can_fetch(config.BOT_NAME, url)
 
+    def sitemaps(self, url: str) -> list[str]:
+        p = urlparse(url)
+        root = f"{p.scheme}://{p.netloc}"
+        self.allowed(root + "/")
+        try:
+            return list(self._cache[root].site_maps() or [])
+        except Exception:
+            return []
+
 
 class Browser:
     """shots: None (no screenshots), 'problems' (only blocked/empty pages) or 'always'."""
@@ -218,6 +247,7 @@ class Browser:
         self._pw = sync_playwright().start()
         self._launch()
         self.robots = Robots()
+        self._sitemaps = {}
         if self.shots_dir:
             import os
             os.makedirs(self.shots_dir, exist_ok=True)
@@ -350,7 +380,33 @@ class Browser:
                 pass
             page.wait_for_timeout(1000)
 
+    def _reveal_dates(self, page):
+        """Open collapsed sections and click in-page 'Dates' / 'Sessions' / 'Termine' buttons and tabs."""
+        try:
+            page.evaluate("() => document.querySelectorAll('details:not([open])').forEach(d => d.open = true)")
+        except Exception:
+            pass
+        clicked = 0
+        for role in ("button", "tab"):
+            try:
+                loc = page.get_by_role(role, name=DATE_BUTTONS)
+                for i in range(min(loc.count(), 4)):
+                    if clicked >= 4:
+                        return
+                    el = loc.nth(i)
+                    if not el.is_visible(timeout=300):
+                        continue
+                    before = page.url
+                    el.click(timeout=2000)
+                    page.wait_for_timeout(1200)
+                    clicked += 1
+                    if page.url != before and lenses.is_ticket_seller(page.url):
+                        page.go_back(timeout=15000)       # never read a ticket seller's page
+            except Exception:
+                continue
+
     def _expand(self, page):
+        self._reveal_dates(page)
         for _ in range(6):
             try:
                 btn = page.get_by_role("button", name=LOAD_MORE).first
@@ -390,6 +446,82 @@ class Browser:
             snap.error = f"PDF: {type(e).__name__}: {str(e)[:150]}"
         return snap
 
+    # -------------------------------------------------------- lenses: background data, calendar files, sitemaps
+    def _feeds(self, page, captured) -> list[dict]:
+        """JSON the page loaded that holds dates (a booking widget's list of performances, a calendar's month).
+        A feed asked for a short window (from=...&to=...) is asked again for the whole season."""
+        found = []
+        for resp in captured:
+            try:
+                body = resp.text()
+            except Exception:
+                continue
+            n = lenses.date_count(body)
+            if n >= 2 and len(body) < 3_000_000:
+                found.append((n, resp.url, body))
+        found.sort(key=lambda x: -x[0])
+        out = []
+        for n, u, body in found[:3]:
+            wide = lenses.widen_feed_url(u, dt.date.today())
+            if wide and self.robots.allowed(wide):
+                try:
+                    r = page.request.get(wide, timeout=20000)
+                    if r.ok and lenses.date_count(r.text()) > n:
+                        u, body = wide, r.text()
+                except Exception:
+                    pass
+            try:
+                body = json.dumps(json.loads(body), ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                pass
+            out.append({"url": u, "text": body[: config.FEED_TEXT_LIMIT]})
+        return out
+
+    def _calendar_files(self, hrefs: list[str]) -> list[dict]:
+        """Events from the page's 'add to calendar' (.ics) files; no model needed to read them."""
+        events = []
+        ics = [h for h in hrefs if re.search(r"(\.ics($|\?)|[?&/]ical\b|format=ical|/ics/)", h, re.I)]
+        for h in list(dict.fromkeys(ics))[:3]:
+            if not self.robots.allowed(h):
+                continue
+            try:
+                r = httpx.get(h, timeout=20, follow_redirects=True, verify=False, headers={"User-Agent": self.ua})
+                if r.status_code == 200 and "BEGIN:VCALENDAR" in r.text[:2000]:
+                    events += lenses.parse_ics(r.text[:500_000])[:200]
+            except Exception:
+                continue
+        return events
+
+    def sitemap(self, url: str, limit: int = 200) -> list[str]:
+        """Event and production pages of this site listed in its sitemap.xml (newest first). Cached per site."""
+        fam = lenses.site_family(url)
+        if fam in self._sitemaps:
+            return self._sitemaps[fam]
+        p = urlparse(url)
+        root = f"{p.scheme}://{p.netloc}"
+        queue = self.robots.sitemaps(url) or [root + "/sitemap.xml", root + "/sitemap_index.xml"]
+        pages, seen, today = [], 0, dt.date.today()
+        while queue and seen < 8:
+            sm = queue.pop(0)
+            seen += 1
+            try:
+                r = httpx.get(sm, timeout=25, follow_redirects=True, verify=False, headers={"User-Agent": config.BOT_UA})
+                if r.status_code != 200:
+                    continue
+                body = r.content
+                if body[:2] == b"\x1f\x8b":
+                    body = gzip.decompress(body)
+                found, kids = lenses.parse_sitemap(body[:8_000_000].decode("utf-8", "ignore"))
+            except Exception:
+                continue
+            pages += found
+            kids.sort(key=lambda k: 0 if lenses.EVENT_PATH.search(urlparse(k).path) else 1)
+            queue += [k for k in kids[:6] if k not in queue]
+        good = [(u, m) for u, m in pages if lenses.site_family(u) == fam and lenses.event_like(u, m, today)]
+        good.sort(key=lambda x: x[1] or "", reverse=True)
+        self._sitemaps[fam] = list(dict.fromkeys(u for u, _ in good))[:limit]
+        return self._sitemaps[fam]
+
     # -------------------------------------------------------- main entry
     def load(self, url: str) -> Snapshot:
         snap = Snapshot(url=url, final_url=url)
@@ -404,8 +536,23 @@ class Browser:
         watchdog = threading.Timer(config.PAGE_HARD_LIMIT_S, self._freeze)
         watchdog.daemon = True
         page = None
+        captured = []
+
+        def on_response(resp):
+            try:
+                if len(captured) >= 40 or resp.request.resource_type not in ("xhr", "fetch"):
+                    return
+                if "json" not in (resp.headers.get("content-type") or "").lower():
+                    return
+                host = urlparse(resp.url).netloc
+                if NOT_PROGRAMME_HOSTS.search(host) or lenses.is_ticket_seller(resp.url):
+                    return
+                captured.append(resp)
+            except Exception:
+                pass
         try:
             page = self._ctx.new_page()
+            page.on("response", on_response)
             watchdog.start()
             resp = None
             for attempt in (1, 2):
@@ -472,6 +619,8 @@ class Browser:
             og = page.locator('meta[property="og:image"]').first
             if og.count():
                 snap.og_image = urljoin(snap.final_url, og.get_attribute("content") or "")
+            snap.feeds = self._feeds(page, captured)
+            snap.events += self._calendar_files([h for _, h in snap.links])
             self._shot(page, snap, problem=bool(snap.blocked) or len(text) < THIN_CHARS
                        or snap.cookie == "banner remains")
         except Exception as e:  # network errors, timeouts, crashes
