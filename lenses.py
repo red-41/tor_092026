@@ -20,8 +20,17 @@ TICKET_SELLERS = (
     "skiddle.", "fever", "ticketpro.", "biletix.", "kupbilecik.", "ebilet.", "goout.", "ticketstream.",
     "oeticket.", "myticket.", "adticket.", "ticketonline.", "tix.", "ticket.fi", "lippu.fi", "tiketti.",
     "billetlugen.", "billettservice.", "ticnet.", "ticketmaster", "ticket-online.", "vivaticket.", "boxol.",
-    "kartenhaus.", "tickets.com",
+    "kartenhaus.", "tickets.com", "teaterbilletter.",
 )
+
+# Resellers and listing sites that are not the venue's own box office: never used as a ticket link.
+AGGREGATORS = ("teaterbilletter.", "viagogo.", "stubhub.", "ticketswap.", "songkick.", "bandsintown.", "todaytix.",
+               "billetreduc.", "fever", "gigsberg.", "seatgeek.", "ticketnetwork.")
+
+
+def is_aggregator(url: str | None) -> bool:
+    host = (urlparse(url or "").netloc or "").lower()
+    return any(t in host for t in AGGREGATORS)
 
 
 def is_ticket_seller(url: str) -> bool:

@@ -539,6 +539,15 @@ def _is_venue(source: dict) -> bool:
     return not re.search(r"(company|festival|competition)", source.get("kind") or "", re.I)
 
 
+def _ticket(it: dict) -> str | None:
+    """The booking link, never a reseller or listing site: then the production page on the venue's own site."""
+    url = it.get("ticket_url")
+    if url and lenses.is_aggregator(url):
+        detail = it.get("detail_url")
+        return detail if detail and not lenses.is_aggregator(detail) else None
+    return url
+
+
 def to_staging(result: dict, run_date: str) -> list[dict]:
     s = result["source"]
     host = urlparse(s.get("website") or "").netloc
@@ -559,7 +568,7 @@ def to_staging(result: dict, run_date: str) -> list[dict]:
             "performance_date": it["date"], "performance_time": it["time"], "time_tbc": it["time"] is None,
             "tags": it["tags"], "genre": it["tags"][0],
             "program": it["program"], "program_position": it["program_position"],
-            "tickets_url": it["ticket_url"], "image_url": it["image_url"], "description": it["description"],
+            "tickets_url": _ticket(it), "image_url": it["image_url"], "description": it["description"],
             "cancelled": it["cancelled"], "date_source": it.get("date_source") or "listed",
             "dedupe_key": db.dedupe_key(host, it, run_date), "status": "pending",
         })

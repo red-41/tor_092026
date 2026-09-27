@@ -39,6 +39,9 @@ performance: the host theatre, a festival, the touring company. Each performance
 
 You get one case at a time:
 - "held": a new listing from one website that might be a performance already published (candidates).
+  Answer "same" when the new listing IS one of the candidates, and put that candidate's id in keep.
+  Answer "different" only when the new listing matches none of the candidates. Other candidates being
+  separate sessions does not make the new listing different.
 - "pair": two published rows that might be the same performance.
 - "conflict": one performance whose trusted websites disagree on its start time or venue.
 
