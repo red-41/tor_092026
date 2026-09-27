@@ -166,3 +166,10 @@ def test_one_failed_case_does_not_stop_the_review(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages", "--no-publish"])
     assert review.main() == 0
     assert applied == [7, 8]
+
+
+def test_aggregator_ticket_links_are_replaced():
+    from run import _ticket
+    assert _ticket({"ticket_url": "https://teaterbilletter.dk/forestillinger/x-1", "detail_url": "https://www.kglteater.dk/en/dance/x/"}) == "https://www.kglteater.dk/en/dance/x/"
+    assert _ticket({"ticket_url": "https://www.viagogo.com/x", "detail_url": None}) is None
+    assert _ticket({"ticket_url": "https://billet.kglteater.dk/x", "detail_url": None}) == "https://billet.kglteater.dk/x"
