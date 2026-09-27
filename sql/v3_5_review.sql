@@ -31,7 +31,7 @@ begin
   if v.id is null then return; end if;
   create temp table if not exists _rk (like performance_sources including defaults) on commit drop;
   alter table _rk add column if not exists rk int;
-  delete from _rk;
+  delete from _rk where true;   -- the API gateway refuses a DELETE without WHERE
   insert into _rk select ps.*, source_rank(ps.source_id, ps.theater_id, coalesce(ps.company_id, v.company_id))
     from performance_sources ps where ps.performance_id = p_id and not ps.ignored;
   if not exists (select 1 from _rk) then return; end if;
