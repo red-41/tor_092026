@@ -288,7 +288,11 @@ def main() -> int:
             print("Claude call failed:", str(e)[:300])
             break
         call = to_call(case, v)
-        result = "not applied (dry run)" if a.dry else db.rpc("apply_review", call)
+        try:
+            result = "not applied (dry run)" if a.dry else db.rpc("apply_review", call)
+        except Exception as e:                      # one failed case must not stop the others
+            result = f"error: {str(e)[:300]}"
+            call = {**call, "p_verdict": "error"}
         key = f"{case['kind']}:{call['p_verdict']}"
         tally[key] = tally.get(key, 0) + 1
         report["cases"].append({"kind": case["kind"], "id": case["id"], "verdict": v, "applied": call["p_verdict"],
