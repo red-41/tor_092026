@@ -141,3 +141,28 @@ def test_timezone_follows_the_country_of_the_date():
     assert _timezone({"country": "United States", "timezone": "America/Chicago", "date": "2027-02-04"}, lisbon) == "America/Chicago"
     assert _timezone({"country": "Belgium", "timezone": "Europe/Paris", "date": "2027-01-26"}, lisbon) == "Europe/Paris"
     assert _timezone({"country": "", "timezone": None}, lisbon) == "Europe/Lisbon"
+
+
+def test_one_failed_case_does_not_stop_the_review(monkeypatch, tmp_path):
+    import sys
+    import config
+    import db
+    applied = []
+
+    def fake_rpc(name, params=None, timeout=600):
+        if name == "review_queue":
+            return [PAIR, dict(PAIR, id=8)]
+        if name == "apply_review":
+            applied.append(params["p_id"])
+            if params["p_id"] == 7:
+                raise RuntimeError("apply_review: 400 boom")
+            return "ok"
+        return 0
+
+    monkeypatch.setattr(db, "rpc", fake_rpc)
+    monkeypatch.setattr(review, "ask", lambda *a: {"verdict": "different", "confidence": 0.95, "reason": "x"})
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages", "--no-publish"])
+    assert review.main() == 0
+    assert applied == [7, 8]
