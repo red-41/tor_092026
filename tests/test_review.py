@@ -173,3 +173,33 @@ def test_aggregator_ticket_links_are_replaced():
     assert _ticket({"ticket_url": "https://teaterbilletter.dk/forestillinger/x-1", "detail_url": "https://www.kglteater.dk/en/dance/x/"}) == "https://www.kglteater.dk/en/dance/x/"
     assert _ticket({"ticket_url": "https://www.viagogo.com/x", "detail_url": None}) is None
     assert _ticket({"ticket_url": "https://billet.kglteater.dk/x", "detail_url": None}) == "https://billet.kglteater.dk/x"
+
+
+def test_lists_returned_as_text_are_read():
+    import json as _json
+    from extract import flatten, runs_of
+    prods = [{"title": "Giselle", "performances": [{"date": "2026-10-01", "time": "19:30"}],
+              "runs": [{"start": "2026-10-01", "end": "2026-10-09"}]}]
+    assert len(flatten({"productions": _json.dumps(prods)})) == 1
+    assert len(runs_of({"productions": _json.dumps(prods)})) == 1
+    assert flatten({"productions": "not json"}) == []
+    assert flatten({"productions": ["Giselle", {"title": "x", "performances": "[]"}]}) == []
+
+
+def test_empty_page_gets_a_fresh_browser():
+    from types import SimpleNamespace
+    import run
+    calls = []
+
+    class FakeBrowser:
+        def load(self, url):
+            calls.append("load")
+            text = "" if len(calls) == 1 else "x" * 500
+            return SimpleNamespace(text=text, events=[], error=None, blocked=None, screenshot=None, cookie="none")
+
+        def _restart(self):
+            calls.append("restart")
+
+    res = {"pages": 0, "screens": [], "cookies": [], "blocked": [], "notes": []}
+    snap = run.open_page(FakeBrowser(), res, "https://x.org")
+    assert calls == ["load", "restart", "load"] and snap is not None

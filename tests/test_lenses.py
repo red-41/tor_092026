@@ -79,3 +79,25 @@ def test_months_in_addresses_are_not_mistaken_for_seasons():
                       ("https://x.org/saison-26-27/x", True), ("https://x.org/event/2025-12-01-x", False),
                       ("https://x.org/event/2026-12-01-x", True)]:
         assert L.event_like(url, "", TODAY) == keep, url
+
+
+def test_month_in_the_path_without_separator_and_stale_months():
+    import datetime as dt
+    import lenses
+    t = dt.date(2026, 10, 1)
+    assert lenses.month_series("https://opera.szczecin.pl/repertuar/202610", t, 2) == [
+        "https://opera.szczecin.pl/repertuar/202611", "https://opera.szczecin.pl/repertuar/202612"]
+    assert lenses.month_series("https://opera.szczecin.pl/spektakle/20262027", t, 2) == []    # a season, not a month
+    assert lenses.month_now("https://operacluj.ro/calendar/2026-10/", dt.date(2026, 12, 3)) == "https://operacluj.ro/calendar/2026-12/"
+    assert lenses.month_now("https://operacluj.ro/calendar/2026-12/", t) == "https://operacluj.ro/calendar/2026-12/"
+
+
+def test_sitemap_event_pages_in_eastern_languages():
+    import datetime as dt
+    import lenses
+    t = dt.date(2026, 10, 1)
+    for u in ["https://bolshoi.ru/afisha/balet-lebedinoe-ozero/", "https://x.ru/%D0%B0%D1%84%D0%B8%D1%88%D0%B0/12",
+              "https://opera.krakow.pl/spektakle/balladyna", "https://x.hu/musor/hattyuk-tava",
+              "https://x.fi/ohjelmisto/joutsenlampi", "https://x.lt/renginiai/gulbiu-ezeras", "https://x.ua/vystavy/1"]:
+        assert lenses.event_like(u, "", t), u
+    assert not lenses.event_like("https://x.ru/news/2026/afisha", "", t)

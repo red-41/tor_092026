@@ -241,12 +241,32 @@ def test_calendar_by_month_is_read_to_the_end_of_the_season_for_core_tiers(world
     today = dt.date.today()
     nxt_y, nxt_m = (today.year + (today.month == 12), today.month % 12 + 1)
     PAGES["https://g.org/"] = {**show("Nutcracker"), "next_page_url": f"https://g.org/cal?month={nxt_y}-{nxt_m:02d}"}
+    months = []
+    y, m = nxt_y, nxt_m
+    for _ in range(12):
+        months.append(f"https://g.org/cal?month={y}-{m:02d}")
+        y, m = (y + (m == 12), m % 12 + 1)
+    # a house that has published the whole season: every month is read (tiers 0-1); tier 2 just follows "next"
+    for u in months:
+        PAGES[u] = show("Giselle " + u[-7:])
     for tier, expected in ((0, 13), (2, 2)):
         sites = Sites()
         mp.setattr(run, "Browser", sites)
         mp.setattr(db, "due_sources", lambda *a, **k: [{**src("G", "https://g.org/"), "priority": tier}])
         run.main([])
         assert len([u for u in sites.opened if "g.org" in u]) == expected, tier
+    # a house that has published two months: reading stops three months after the last month with shows
+    h = [u.replace("g.org", "mm.org") for u in months]
+    PAGES["https://mm.org/"] = {**show("Nutcracker"), "next_page_url": h[0]}
+    for u in h[:2]:
+        PAGES[u] = show("Giselle " + u[-7:])
+    sites = Sites()
+    mp.setattr(run, "Browser", sites)
+    mp.setattr(db, "due_sources", lambda *a, **k: [{**src("MM", "https://mm.org/"), "priority": 0}])
+    run.main([])
+    assert [u for u in sites.opened if "cal?" in u] == h[:5]
+    for u in months + h[:2] + ["https://mm.org/"]:
+        PAGES.pop(u, None)
 
 
 def test_a_dance_category_that_pays_off_is_remembered_and_read_next_time(world):

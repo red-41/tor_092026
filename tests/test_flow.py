@@ -199,6 +199,9 @@ def full_run(env, monkeypatch, tmp_path):
     monkeypatch.setattr(db, "update_source", lambda sid, fields: writes["updated"].append(fields))
     monkeypatch.setattr(db, "record_check", lambda row: writes["checks"].append(row))
     monkeypatch.setattr(run.config, "USE_BATCH", True)
+    writes["pending"] = []
+    monkeypatch.setattr(db, "pending_all", lambda: [])
+    monkeypatch.setattr(db, "pending_put", lambda rows: writes["pending"].extend(rows))
     return ex, writes, tmp_path
 
 
@@ -206,11 +209,13 @@ def test_two_rounds_listing_and_production_pages_both_batched(full_run):
     ex, writes, tmp = full_run
     batches = ex.client.messages.batches
     assert run.main([]) == 0
-    assert batches.created == 2                                   # round 1: schedule page, round 2: production page
+    # round 1: the homepage; then the dance page it points to; then the production page: all at half price
+    assert batches.created == 3
     assert len(writes["staged"]) == 1 and writes["staged"][0]["performance_time"] == "19:30"
     assert writes["updated"][0]["status"] == "ok"
     report = next(tmp.joinpath("reports").glob("run-*.md")).read_text()
-    assert "2 pages via the Batch API" in report and "credit ran out" not in report
+    assert "3 pages via the Batch API" in report and "0 pages at full price" in report
+    assert "credit ran out" not in report
 
 
 def test_credit_running_out_stops_cleanly(full_run, monkeypatch):
@@ -254,7 +259,7 @@ def test_credit_running_out_in_round_two_keeps_what_was_found(full_run, monkeypa
 
     def create(**kw):
         resp = orig(**kw)
-        if "URL: https://x.org/ballet\n" in kw["messages"][0]["content"]:
+        if "URL: https://x.org/\n" in kw["messages"][0]["content"]:
             resp.content[0].input = {"page_status": "has_performances", "detail_links": ["https://x.org/ballet/giselle"],
                                      "productions": [{"title": "Bolero", "tags": ["Contemporary"],
                                                       "performances": [{"venue": "Opera", "date": FUTURE, "time": "20:00"}]}]}
@@ -266,3 +271,59 @@ def test_credit_running_out_in_round_two_keeps_what_was_found(full_run, monkeypa
     due = dt.datetime.fromisoformat(writes["updated"][0]["next_check_at"])
     assert due < dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)  # due again straight away
     assert "credit ran out" in next(tmp.joinpath("reports").glob("run-*.md")).read_text()
+
+
+def _slow_after(fb, n):
+    """Batches after the first n never finish within the run."""
+    monkey = {"ended": set(range(1, n + 1))}
+    fb.retrieve = lambda bid: SimpleNamespace(processing_status="ended" if int(bid[1:]) in monkey["ended"] else "in_progress")
+
+
+def test_pages_still_with_claude_at_the_end_are_kept_not_cancelled(full_run, monkeypatch):
+    ex, writes, tmp = full_run
+    fb = ex.client.messages.batches
+    cancelled = []
+    fb.cancel = lambda bid: cancelled.append(bid)
+    _slow_after(fb, 2)                       # homepage and dance page answered, the production page is not
+    monkeypatch.setattr(run.config, "JOB_MINUTES", 0.03)
+    monkeypatch.setattr(run.config, "DETAIL_RESERVE_MINUTES", 0)
+    monkeypatch.setattr(run.Batch, "POLL_S", 0)
+    assert run.main([]) == 0
+    assert cancelled == []                                            # nothing paid for is thrown away
+    assert [(r["url"], r["role"], r["batch_id"]) for r in writes["pending"]] == [
+        ("https://x.org/ballet/giselle", run.DETAIL, "b3")]
+    up = writes["updated"][0]
+    assert up["status"] == "partial" and "still with Claude" in up["notes"]
+    due = dt.datetime.fromisoformat(up["next_check_at"])
+    assert due <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=1)   # looked at again next run
+
+
+def test_schedule_page_still_with_claude_leaves_the_source_untouched(full_run, monkeypatch):
+    ex, writes, tmp = full_run
+    _slow_after(ex.client.messages.batches, 0)
+    monkeypatch.setattr(run.config, "JOB_MINUTES", 0.02)
+    monkeypatch.setattr(run.config, "DETAIL_RESERVE_MINUTES", 0)
+    monkeypatch.setattr(run.Batch, "POLL_S", 0)
+    assert run.main([]) == 0
+    assert writes["updated"] == [] and writes["staged"] == []
+    assert [r["role"] for r in writes["pending"]] == [run.LISTING]
+    report = next(tmp.joinpath("reports").glob("run-*.md")).read_text()
+    assert "| X Opera | not read |" in report
+
+
+def test_answers_left_by_an_earlier_run_are_collected(env, monkeypatch):
+    ex, _ = env
+    fb = ex.client.messages.batches
+    fb.create([{"custom_id": "p000001", "params": {"messages": [{"role": "user", "content": "URL: https://x.org/ballet/giselle\n"}]}}])
+    stored, done = [], []
+    monkeypatch.setattr(db, "pending_all", lambda: [
+        {"url": "https://x.org/ballet/giselle", "role": run.DETAIL, "text_hash": "h1", "model": "fake",
+         "batch_id": "b1", "custom_id": "p000001"},
+        {"url": "https://y.org/", "role": run.LISTING, "text_hash": "h2", "model": "fake",
+         "batch_id": "b9", "custom_id": "p000002"}])
+    monkeypatch.setattr(db, "cache_put", lambda *a: stored.append(a))
+    monkeypatch.setattr(db, "pending_done", lambda url, role: done.append(url))
+    fb.retrieve = lambda bid: SimpleNamespace(processing_status="ended" if bid == "b1" else "in_progress")
+    assert run.harvest_pending(ex) == 1
+    assert stored[0][:4] == ("https://x.org/ballet/giselle", run.DETAIL, "h1", "fake")
+    assert done == ["https://x.org/ballet/giselle"]                  # b9 still running: kept for next time
