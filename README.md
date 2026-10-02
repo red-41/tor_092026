@@ -55,13 +55,20 @@ It respects each site's robots.txt and waits 2 seconds between page loads.
 
 The core sites get a more thorough treatment. Each lens looks for dates the schedule page does not show directly:
 
-- **Calendars by month**: when the next-month link has a pattern (`?month=2026-11`, `/2026/11/`, `?luna=11&anul=2026`),
-  every month up to 12 ahead is opened directly (up to 14 schedule pages).
+- **Calendars by month**: when the next-month link has a pattern (`?month=2026-11`, `/2026/11/`, `/202611`,
+  `?luna=11&anul=2026`), the following months are opened directly, three at a time: reading goes on until three months
+  past the last month that has shows (up to 12 months ahead; months do not count against the 14 schedule pages).
+  A remembered month page that has passed (`/calendar/2026-10/` in December) is read as the current month instead.
+  When the later months are empty, the report says "published so far up to ..." instead of a CHECK.
+- **Hidden slides and tabs**: a season shown a few months at a time in a carousel, or month tabs, is read in full
+  (the hidden panels' text is added to the page). "Load more" buttons are clicked in about 20 languages.
 - **Background data**: booking widgets and JavaScript calendars load their dates as data. That data is kept and read with
   the page; a feed asked for one week (`from=...&to=...`) is asked again for the whole season.
 - **Calendar files**: "add to calendar" (.ics) files are read directly, no model needed.
 - **Buttons**: in-page "Dates", "Sessions", "Termine", "Séances"... buttons and tabs are clicked; collapsed sections opened.
 - **Sitemap**: the site's sitemap.xml gives its current production pages; the dance ones are opened even if no calendar shows them.
+  Event addresses are recognised in Western and Eastern European languages, in Latin or Cyrillic or Greek script
+  (afisha, spektakl, repertuar, predstav, műsor, ohjelmisto, renginiai, афиша, спектакль...).
 - **Several dance categories**: Claude lists every other dance-related category or filter (ballet, dance, guest performances,
   family dance). One that produces shows is remembered in `sources.extra_schedule_urls` and read every time.
 - **Date hunt**: when a production shows only a range ("2 Dec to 2 Jan") or fewer dates than it announces ("12 performances"),
@@ -116,9 +123,14 @@ After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC. Each 
 - **Unchanged pages** are not sent to Claude again (page cache for up to 28 days), so weekly runs cost a fraction of the first.
   "Unchanged" ignores ticket noise: sold out, few tickets left, seat counts, "today/tomorrow" labels, and lines that only moved around.
 - **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old. New productions are always read.
-- **Batch API** (half price): first every schedule page in one bundle, then production pages in small bundles sent while browsing
-  goes on. **Each site is saved as soon as its own pages are answered**, so a job that is stopped part way keeps every site it finished.
-  If a bundle is not answered in time, those schedule pages are read straight away at full price; production pages wait for the next run.
+- **Batch API** (half price) for every page: first every site's schedule page in one bundle, then the further schedule
+  pages (other categories, next pages, months) and the production pages in small bundles sent while browsing goes on;
+  an answer that points to more pages opens them in the next bundle. **Each site is saved as soon as its own pages are
+  answered**, so a job that is stopped part way keeps every site it finished.
+- **Nothing paid for is thrown away**: bundles still running when the job ends are not cancelled. Their pages are noted in
+  `collector_page_cache` (role `pending|...`), the site is looked at again at the next run, and that run first collects the
+  answers (Anthropic keeps them 29 days), so an unchanged page costs nothing the second time. A site whose very first page
+  was still with Claude is left untouched and due.
 - **Finding the dance programme**: when a homepage shows no dance but links to the dance programme, dance filter or calendar,
   that page is read and becomes the site's schedule page. Programme overview pages open their show pages (one level down).
 - **Even split**: sites are dealt to the 12 jobs like cards, so every job gets the same number of sites from each tier.

@@ -208,6 +208,9 @@ class Extractor:
         for block in resp.content:
             if block.type == "tool_use":
                 data = dict(block.input)
+                for key in ("productions", "detail_links", "listing_links"):
+                    if key in data:
+                        data[key] = _as_list(data[key])
                 if truncated:
                     data["notes"] = ((data.get("notes") or "") + " [answer cut off: page too long]").strip()
                     data["_truncated"] = True
@@ -238,7 +241,6 @@ class Batch:
 
     CHUNK = 800            # requests per batch (keeps each batch well under the 256 MB limit)
     POLL_S = 60            # how often to ask whether a batch has finished
-    GIVE_UP_S = 300        # after the deadline: time allowed for cancelled batches to stop
 
     def __init__(self, ex: Extractor):
         self.ex = ex
@@ -330,32 +332,28 @@ class Batch:
 
     def wait(self, deadline: float, poll_s: float | None = None, until_any: bool = False) -> list[tuple[str, dict | None]]:
         """Send what is left and wait: for everything, or (until_any) until something has finished.
-        At the deadline, cancel what is still running, give it a few minutes, and return None for the rest."""
+        At the deadline nothing is cancelled: batches still running stay open (see leave_open). Their answers are
+        paid for either way, so the next run picks them up instead of paying for the pages a second time."""
         poll_s = self.POLL_S if poll_s is None else poll_s
         self.submit()
         out = self.poll(force=True)
         while self._open and not (until_any and out):
             if time.time() > deadline:
-                out += self._give_up(poll_s)
                 break
             time.sleep(poll_s)
             out += self.poll(force=True)
         return out
 
-    def _give_up(self, poll_s: float) -> list[tuple[str, dict | None]]:
-        print("batch: out of time, cancelling what is left", flush=True)
-        for bid in self._open:
-            try:
-                self.ex.client.messages.batches.cancel(bid)
-            except Exception:
-                pass
-        out, stop = [], time.time() + self.GIVE_UP_S
-        while self._open and time.time() < stop:
-            time.sleep(min(15, poll_s))
-            out += self.poll(force=True)
-        for bid in list(self._open):
-            out += [(k, None) for k in self._open.pop(bid)]
-        return out
+    def drop_unsent(self) -> list[str]:
+        """Pages added but never sent (the run ended first): not billed; they are simply read next run."""
+        keys = [r["custom_id"] for r in self._unsent] + self._failed
+        self._unsent, self._failed = [], []
+        return keys
+
+    def leave_open(self) -> dict[str, list[str]]:
+        """Batches still running (batch id -> keys). They are kept by Anthropic for 29 days; the caller records them."""
+        left, self._open = self._open, {}
+        return left
 
     def run(self, deadline: float, poll_s: float | None = None) -> list[tuple[str, dict | None]]:
         """Send everything and wait for all of it."""
@@ -400,8 +398,10 @@ DATE_IN_FEED = re.compile(r"20\d\d-[01]\d-[0-3]\d(?:[T ][0-2]\d:[0-5]\d)?")
 def runs_of(data: dict) -> list[dict]:
     """Runs whose individual dates are not all listed, with their production's details."""
     out = []
-    for prod in data.get("productions") or []:
-        for r in prod.get("runs") or []:
+    for prod in _as_list(data.get("productions")):
+        if not isinstance(prod, dict):
+            continue
+        for r in _as_list(prod.get("runs")):
             if not isinstance(r, dict):
                 continue
             out.append({"title": (prod.get("title") or "").strip(), "work": prod.get("work"), "company": prod.get("company"),
@@ -416,13 +416,28 @@ def runs_of(data: dict) -> list[dict]:
     return [r for r in out if r["title"]]
 
 
+def _as_list(v) -> list:
+    """The model sometimes returns a list as a JSON string: read it back as a list; anything else becomes []."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return []
+    if isinstance(v, dict):
+        v = [v]
+    return v if isinstance(v, list) else []
+
+
 def flatten(data: dict) -> list[dict]:
     """productions -> one flat item per performance, in the shape clean_performance expects."""
     items = []
-    for prod in data.get("productions") or []:
+    for prod in _as_list(data.get("productions")):
+        if not isinstance(prod, dict):
+            continue
         base = {k: v for k, v in prod.items() if k != "performances"}
-        for perf in prod.get("performances") or []:
-            items.append({**base, **perf})
+        for perf in _as_list(prod.get("performances")):
+            if isinstance(perf, dict):
+                items.append({**base, **perf})
     return items
 
 

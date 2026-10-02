@@ -112,7 +112,44 @@ BANNER_JS = """(remove) => {
 LOAD_MORE = re.compile(r"(load more|show more|more events|see more|view more|all dates|mehr anzeigen|weitere termine|mehr laden|"
                        r"voir plus|afficher plus|plus de dates|meer laden|toon meer|meer tonen|toon volgende|meer weergeven|"
                        r"mostra altri|mostra di più|carica altri|ver más|cargar más|pokaż więcej|näytä lisää|vis flere|"
-                       r"se flere|visa fler|načíst další|zobrazit další|zobrazit více|načíst více|további|mais eventos)", re.I)
+                       r"se flere|visa fler|načíst další|zobrazit další|zobrazit více|načíst více|további|mais eventos|"
+                       r"mehr vorstellungen|weitere vorstellungen|mehr termine|alle vorstellungen|"
+                       r"zobacz więcej|więcej terminów|pokaż wszystkie|załaduj więcej|zobraziť viac|načítať viac|ďalšie termíny|"
+                       r"показать (?:ещё|еще|больше|все)|загрузить (?:ещё|еще)|ще вистави|показати (?:більше|ще|всі)|"
+                       r"покажи още|зареди още|още събития|vezi mai multe|încarcă mai multe|mai multe spectacole|"
+                       r"rodyti daugiau|daugiau renginių|rādīt vairāk|vairāk pasākumu|näita rohkem|lae rohkem|"
+                       r"prikaži više|učitaj više|više predstava|pokaži več|naloži več|"
+                       r"περισσότερα|daha fazla|tümünü göster|meer voorstellingen|plus de spectacles|altre date|más fechas)", re.I)
+# Text of carousel slides and tab panels that are hidden until clicked (a season shown three months at a time with
+# arrow buttons, month tabs). The visible text leaves them out; their dates are part of the programme.
+HIDDEN_PANELS_JS = r"""() => {
+  const sel = '[class*="slide"],[class*="carousel"],[class*="swiper"],[class*="slick"],[class*="tab-pane"],' +
+              '[class*="tabpanel"],[class*="tab-content"],[role="tabpanel"],[class*="month"]';
+  const out = [];
+  let size = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    if (el.closest('nav,header,footer,[role="dialog"],[role="navigation"]')) continue;
+    const st = getComputedStyle(el);
+    if (st.display !== 'none' && st.visibility !== 'hidden') continue;
+    let inner = false;                            // only the outermost hidden panel
+    for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+      const ps = getComputedStyle(a);
+      if (ps.display === 'none' || ps.visibility === 'hidden') { inner = true; break; }
+    }
+    if (inner) continue;
+    const parts = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {acceptNode: n =>
+      n.parentElement && /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.parentElement.tagName) ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT});
+    while (walk.nextNode()) { const t = walk.currentNode.nodeValue.trim(); if (t) parts.push(t); }
+    const text = parts.join('\n');
+    if (text.length < 20) continue;
+    out.push(text);
+    size += text.length;
+    if (size > 30000) break;
+  }
+  return out.join('\n\n').slice(0, 30000);
+}"""
 # In-page buttons and tabs that reveal a production's individual dates (never links that leave the page).
 DATE_BUTTONS = re.compile(
     r"^\s*(dates?|all dates|show dates|see (?:all )?dates|view (?:all )?dates|more dates|dates (?:and|&) (?:tickets|times|prices)|"
@@ -370,6 +407,16 @@ class Browser:
             return ""
         return re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t]+", " ", t)).strip()
 
+    @staticmethod
+    def _hidden_text(page) -> str:
+        """Carousel slides and tab panels hidden until clicked (added after the block and consent checks)."""
+        try:
+            hidden = page.evaluate(HIDDEN_PANELS_JS) or ""
+        except Exception:
+            return ""
+        hidden = re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t]+", " ", hidden)).strip()
+        return "\n\n[Also on the page, in slides or tabs not shown until clicked:]\n" + hidden if hidden else ""
+
     def _wait_out_check(self, page):
         """Some sites show a few seconds of 'Checking your browser' before the page. Wait for it to finish."""
         for _ in range(int(config.CHALLENGE_WAIT_S)):
@@ -598,6 +645,8 @@ class Browser:
             except Exception:
                 html = ""
             snap.blocked = detect_block(snap.status, snap.title, text, html)
+            if not snap.blocked:
+                snap.text = text + self._hidden_text(page)
             links = page.eval_on_selector_all(       # SVG links have an object as href; take its text form
                 "a[href]", "els => els.map(a => [(a.innerText || a.title || a.textContent || '').trim().slice(0, 140),"
                            " typeof a.href === 'string' ? a.href : (a.getAttribute('href') || '')])")

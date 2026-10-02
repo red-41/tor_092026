@@ -9,7 +9,7 @@ All pure functions (no browser, no network), so each can be tested on its own:
 """
 import datetime as dt
 import re
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 # ----------------------------------------------------------------------------- third-party ticket sellers
 TICKET_SELLERS = (
@@ -57,22 +57,12 @@ def _add_months(year: int, month: int, n: int) -> tuple[int, int]:
     return k // 12, k % 12 + 1
 
 
-def month_series(url: str, today: dt.date, months_ahead: int = 12) -> list[str]:
-    """If `url` is one month of a calendar, the addresses of the following months up to `months_ahead` from today.
-    Understood: ?month=2026-11, ?month=01-11-2026, ?date=2026-11-01, /2026/11/, /2026-11, ?luna=11&anul=2026,
-    ?m=11&y=2026. Anything else: [] (the collector then just follows the site's own 'next' link)."""
+def _month_url(url: str):
+    """(year, month, make) when `url` is one month of a calendar; make(y, m) gives the address of another month.
+    Understood: ?month=2026-11, ?month=01-11-2026, ?date=2026-11-01, /2026/11/, /2026-11, /202611, ?luna=11&anul=2026,
+    ?m=11&y=2026. Anything else: None."""
     p = urlparse(url)
     q = parse_qsl(p.query, keep_blank_values=True)
-    last = _add_months(today.year, today.month, months_ahead)
-
-    def series(year, month, make):
-        out, y, m = [], year, month
-        for _ in range(24):
-            y, m = _add_months(y, m, 1)
-            if (y, m) > last:
-                break
-            out.append(make(y, m))
-        return out
 
     # separate month and year parameters
     mi = next((i for i, (k, v) in enumerate(q) if re.fullmatch(_MONTH_KEYS, k, re.I) and re.fullmatch(r"\d{1,2}", v)), None)
@@ -85,7 +75,7 @@ def month_series(url: str, today: dt.date, months_ahead: int = 12) -> list[str]:
             qq[mi] = (qq[mi][0], str(m).zfill(width))
             qq[yi] = (qq[yi][0], str(y))
             return urlunparse(p._replace(query=urlencode(qq, safe="-/:")))
-        return series(int(q[yi][1]), int(q[mi][1]), make)
+        return int(q[yi][1]), int(q[mi][1]), make
 
     # one parameter holding a date or a month
     forms = [
@@ -115,18 +105,55 @@ def month_series(url: str, today: dt.date, months_ahead: int = 12) -> list[str]:
                 qq = list(q)
                 qq[i] = (k, fmt(yy, mm, 1))
                 return urlunparse(p._replace(query=urlencode(qq, safe="-/:.")))
-            return series(y, m, make)
+            return y, m, make
 
-    # the month in the path: /2026/11/ or /2026-11
-    mt = re.search(r"/(20\d\d)([/-])(\d{1,2})(?=/|$)", p.path)
-    if mt and 1 <= int(mt.group(3)) <= 12:
-        width = len(mt.group(3))
+    # the month in the path: /2026/11/, /2026-11 or /202611 (a six-digit block, not a season like /20262027)
+    for rx in (r"/(20\d\d)([/-])(\d{1,2})(?=/|$)", r"/(20\d\d)()(\d{2})(?=/|$|\.html?$)"):
+        mt = re.search(rx, p.path)
+        if mt and 1 <= int(mt.group(3)) <= 12:
+            width = len(mt.group(3))
 
-        def make(y, m):
-            path = p.path[: mt.start()] + f"/{y}{mt.group(2)}{str(m).zfill(width)}" + p.path[mt.end():]
-            return urlunparse(p._replace(path=path))
-        return series(int(mt.group(1)), int(mt.group(3)), make)
-    return []
+            def make(y, m, mt=mt, width=width):
+                path = p.path[: mt.start()] + f"/{y}{mt.group(2)}{str(m).zfill(width)}" + p.path[mt.end():]
+                return urlunparse(p._replace(path=path))
+            return int(mt.group(1)), int(mt.group(3)), make
+    return None
+
+
+def month_series(url: str, today: dt.date, months_ahead: int = 12) -> list[str]:
+    """If `url` is one month of a calendar, the addresses of the following months up to `months_ahead` from today.
+    Anything else: [] (the collector then just follows the site's own 'next' link)."""
+    found = _month_url(url)
+    if not found:
+        return []
+    year, month, make = found
+    last = _add_months(today.year, today.month, months_ahead)
+    out, y, m = [], year, month
+    for _ in range(24):
+        y, m = _add_months(y, m, 1)
+        if (y, m) > last:
+            break
+        out.append(make(y, m))
+    return out
+
+
+def same_address_key(url: str) -> str:
+    """One spelling of an address for comparisons (',' vs '%2C', '%20' vs '+', no #fragment)."""
+    try:
+        p = urlparse(url)
+        q = parse_qsl(p.query, keep_blank_values=True)
+        return urlunparse(p._replace(path=unquote(p.path), query=urlencode(q, safe="-/:.,"), fragment=""))
+    except Exception:
+        return url
+
+
+def month_now(url: str, today: dt.date) -> str:
+    """A remembered calendar page for a month that has passed (/calendar/2026-10/ in December) -> this month's page."""
+    found = _month_url(url)
+    if not found:
+        return url
+    year, month, make = found
+    return make(today.year, today.month) if (year, month) < (today.year, today.month) else url
 
 
 # ----------------------------------------------------------------------------- data feeds asked for a short window
@@ -232,7 +259,14 @@ EVENT_PATH = re.compile(
     r"(event|evenement|veranstaltung|spielplan|production|produktion|spectacle|voorstelling|forestilling|"
     r"f[oö]rest[aä]llning|programm|program|agenda|kalender|calendar|calendrier|show|performance|st[uü]ck|obra|"
     r"espectaculo|espect[aá]culo|spettacolo|ballet|ballett|balet|danse|dance|tanz|dans|danza|dan[cç]a|taniec|"
-    r"tanec|tanssi|repertoire|repertoar|season|saison|seizoen|stagione|temporada|sezon|whats-on|what-s-on)", re.I)
+    r"tanec|tanssi|repertoire|repertoar|season|saison|seizoen|stagione|temporada|sezon|whats-on|what-s-on|"
+    # Central and Eastern Europe, the Baltics, the Nordics, Greece and Turkey (transliterated and native script)
+    r"afisha|afisa|afiša|afiche|plakat|spektakl|spektakli|predstav|vystav|vistav|repertuar|raspored|spored|izved|izrad|"
+    r"wydarzen|wystep|występ|udalost|události|akce|podujat|program|musor|műsor|eloadas|előadás|esity|ohjelmisto|"
+    r"tapahtum|renginiai|renginys|pasakum|pasākum|izrād|etendus|sundmus|sündmus|evenimen|spectacol|reprezentat|"
+    r"ekdilos|parastas|etkinlik|gosteri|gösteri|oyun|balett|baletas|balets|baletti|bale|"
+    r"афиш|спектакл|репертуар|представлен|вистав|події|подiї|балет|танц|събити|изведб|претстав|"
+    r"παράστασ|εκδήλωσ|μπαλέτο|χορ)", re.I)
 OLD_SEASON = re.compile(r"(?<!\d)(20\d\d)(?:[-/_]?(20)?(\d\d))?(?!\d)")
 
 
@@ -250,7 +284,7 @@ def parse_sitemap(xml: str) -> tuple[list[tuple[str, str]], list[str]]:
 
 def event_like(url: str, lastmod: str, today: dt.date) -> bool:
     """A page of an event or production in this or next season (not the archive, not news or people)."""
-    path = urlparse(url).path.lower()
+    path = unquote(urlparse(url).path).lower()           # /%D0%B0%D1%84%D0%B8%D1%88%D0%B0/ -> /афиша/
     if not EVENT_PATH.search(path) or re.search(r"(archiv|archive|news|nieuws|actualit|press|presse|blog|artist|"
                                                 r"kuenstler|people|team|job|vacature|education|workshop|kurs|class)", path):
         return False

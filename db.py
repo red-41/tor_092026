@@ -169,6 +169,57 @@ def cache_peek(url: str, role: str) -> dict | None:
         return None
 
 
+PENDING = "pending|"     # role prefix of a page whose answer is still with the Batch API (picked up next run)
+
+
+def pending_put(rows: list[dict]) -> None:
+    """Remember pages still being answered when the run ended: {url, role, text_hash, model, batch_id, custom_id}."""
+    if not rows:
+        return
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    body = [{"url": r["url"], "role": PENDING + r["role"], "text_hash": r["text_hash"], "model": r["model"],
+             "result": {"batch_id": r["batch_id"], "custom_id": r["custom_id"]}, "updated_at": now} for r in rows]
+    try:
+        with _client() as c:
+            for i in range(0, len(body), 200):
+                r = c.post("/collector_page_cache", params={"on_conflict": "url,role"}, json=body[i:i + 200],
+                           headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
+                if r.status_code >= 400:
+                    print(f"could not record pages still with Claude: {r.status_code} {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"could not record pages still with Claude: {e}", flush=True)
+
+
+def pending_all() -> list[dict]:
+    """Pages left with the Batch API by earlier runs: {url, role (without prefix), text_hash, model, batch_id, custom_id}."""
+    try:
+        rows = []
+        with _client() as c:
+            while True:                               # the API returns at most 1000 rows at a time
+                r = c.get("/collector_page_cache", params={"select": "url,role,text_hash,model,result,updated_at",
+                                                            "role": f"like.{PENDING}*", "order": "url,role",
+                                                            "limit": "1000", "offset": str(len(rows))})
+                if r.status_code >= 400:
+                    break
+                page = r.json()
+                rows += page
+                if len(page) < 1000:
+                    break
+            return [{"url": x["url"], "role": x["role"][len(PENDING):], "text_hash": x["text_hash"], "model": x["model"],
+                     "batch_id": (x["result"] or {}).get("batch_id"), "custom_id": (x["result"] or {}).get("custom_id"),
+                     "updated_at": x["updated_at"]} for x in rows]
+    except Exception:
+        return []
+
+
+def pending_done(url: str, role: str) -> None:
+    try:
+        with _client() as c:
+            c.delete("/collector_page_cache", params={"url": f"eq.{url}", "role": f"eq.{PENDING}{role}"})
+    except Exception:
+        pass
+
+
 def cache_put(url: str, role: str, text_hash: str, model: str, result: dict) -> None:
     try:
         with _client() as c:

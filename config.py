@@ -33,6 +33,7 @@ SITEMAP_LIMIT = 200             # event/production addresses from a site's sitem
 CORE_TIERS = (0, 1)
 MAX_LISTING_PAGES_CORE = 14     # schedule pages per source for tiers 0-1 (a season is up to 12 months)
 MONTHS_AHEAD = 12
+MONTH_LOOKAHEAD = 3              # a calendar by month is read until this many months past the last month with shows
 HUNT_PAGES = 10                 # extra pages per source to find the individual dates of a run (tiers 0-1)
 MAX_EXTRA_START_PAGES = 6       # other dance categories / calendars remembered per source
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "2.0"))       # politeness delay between page loads

@@ -179,6 +179,14 @@ def _light(snap):
 
 def open_page(br: Browser, result: dict, url: str):
     snap = br.load(url)
+    if not snap.error and not snap.blocked and len(snap.text) < THIN and not snap.events:
+        # an almost empty page is often a browser that has gone bad (several sites in a row came back with the
+        # same 51 characters): start a fresh browser and try once more before calling the page empty
+        try:
+            br._restart()
+            snap = br.load(url)
+        except Exception:
+            pass
     result["pages"] += 1
     if snap.screenshot:
         result["screens"].append(snap.screenshot)
@@ -226,24 +234,97 @@ def handle_listing(result: dict, snap, data: dict, url: str | None = None) -> No
         if isinstance(u, str) and u.startswith("http") and u not in st["visited"] and u not in st["queue"]:
             st["queue"].append(u)
             st["origin"].setdefault(u, "listing_link")
+    if st["origin"].get(url) == "month":
+        st["months_read"] += 1
+        if found or new_details:
+            # this month has shows: keep reading ahead, MONTH_LOOKAHEAD months past the last month with shows
+            if url in st["month_list"]:
+                queue_months(st, st["month_list"].index(url) + 1 + config.MONTH_LOOKAHEAD)
+        else:
+            st["months_empty"] += 1
     nxt = data.get("next_page_url")
-    if isinstance(nxt, str) and nxt.startswith("http") and nxt not in st["visited"] and nxt not in st["queue"]:
+    if (isinstance(nxt, str) and nxt.startswith("http") and nxt not in st["visited"] and nxt not in st["queue"]
+            and lenses.same_address_key(nxt) not in st.setdefault("month_keys", set())):   # months: look-ahead below
         st["queue"].append(nxt)
         st["origin"].setdefault(nxt, "next")
         st["paged"] = True
-        if st["core"] and not st["months_queued"]:        # a calendar by month: jump to every month of the season
+        if st["core"] and not st["months_queued"]:
+            # a calendar by month: read the next months a few at a time, and stop a few months after the last
+            # month that has shows (most houses publish one to three months ahead, some the whole season)
             months = [m for m in lenses.month_series(nxt, st["today"], config.MONTHS_AHEAD)
                       if m not in st["visited"] and m not in st["queue"]]
             if months:
                 st["months_queued"] = True
-                st["queue"] += months
-                for m in months:
-                    st["origin"][m] = "month"
+                st["month_list"] = [nxt] + months
+                st["month_keys"] = {lenses.same_address_key(m) for m in st["month_list"]}
+                st["month_upto"] = 1
+                st["origin"][nxt] = "month"
+                queue_months(st, 1 + config.MONTH_LOOKAHEAD)
     for r in runs_of(data):
         add_run(result, r, "listing")
         hunt(result, r)
     if data.get("notes"):
         result["notes"].append(data["notes"])
+
+
+def queue_months(st: dict, upto: int) -> None:
+    """Queue the calendar's months up to position `upto` (the months of a calendar read with a look-ahead)."""
+    lst = st["month_list"]
+    upto = min(upto, len(lst))
+    for m in lst[st["month_upto"]:upto]:
+        if m not in st["visited"] and m not in st["queue"]:
+            st["queue"].append(m)
+            st["origin"][m] = "month"
+    st["month_upto"] = max(st["month_upto"], upto)
+
+
+def _light_listing(snap):
+    """What a schedule page needs to keep while its answer is pending: its address and text (for the times shown)."""
+    return SimpleNamespace(og_image=snap.og_image, final_url=snap.final_url, text=snap.text)
+
+
+def open_listings(br: Browser, ex: Extractor, result: dict, use_cache: bool = True, batch: Batch | None = None,
+                  stop_at: float | None = None) -> None:
+    """The further schedule pages (the dance programme, other categories, next pages, the months of a calendar).
+    With a batch they go out at half price and come back through apply_batch, which may queue more; without one
+    they are read straight away. Months have their own allowance (MONTHS_AHEAD), the rest share the listing cap."""
+    source, st = result["source"], result["_state"]
+    max_listing = config.MAX_LISTING_PAGES_CORE if st["core"] else config.MAX_LISTING_PAGES
+    t0 = time.monotonic()
+    try:
+        while st["queue"]:
+            if stop_at and time.time() > stop_at:
+                if not st["out_of_time"]:
+                    st["out_of_time"] = True
+                    result["notes"].append(f"out of time after {result['pages']} pages; the rest next run")
+                return
+            url = st["queue"].pop(0)
+            if url in st["visited"]:
+                continue
+            month = st["origin"].get(url) == "month"
+            if not month and st["listing_opened"] >= max_listing:
+                st["listing_skipped"] = st.get("listing_skipped", 0) + 1
+                continue
+            st["visited"].add(url)
+            if not month:
+                st["listing_opened"] += 1
+            snap = open_page(br, result, url)
+            if not snap:
+                continue
+            st["readable"] += 1
+            if batch is None:
+                handle_listing(result, snap, read_page(ex, snap, source, st["venues"], LISTING, use_cache), url)
+                continue
+            h = page_hash(snap)
+            hit = db.cache_get(snap.final_url, LISTING, h, ex.model) if use_cache else None
+            if hit is not None:
+                ex.cache_hits += 1
+                handle_listing(result, snap, hit, url)
+                continue
+            batch.add(ex.request_params(snap, source, st["venues"], LISTING), ("more", result, _light_listing(snap), url, h))
+            result["pending"] += 1
+    finally:
+        _spent(result, t0)
 
 
 def start_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = True, batch: Batch | None = None) -> dict:
@@ -259,16 +340,19 @@ def start_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = Tru
                          "cap": config.DETAIL_CAP.get(2 if prio is None else prio, config.MAX_DETAIL_PAGES),
                          "core": prio in config.CORE_TIERS, "origin": {}, "learned": [], "listing_dates": [],
                          "paged": False, "months_queued": False, "runs": {}, "hunt": {}, "hunt_queue": [],
-                         "hunts_used": 0}}
+                         "hunts_used": 0, "listing_opened": 0, "month_list": [], "month_upto": 0, "months_read": 0,
+                         "months_empty": 0, "first_waiting": False, "left_open": 0}}
     st = result["_state"]
     t0 = time.monotonic()
     start = source.get("schedule_url") or source.get("website")
     st["visited"].add(start)
     for u in (source.get("extra_schedule_urls") or [])[: config.MAX_EXTRA_START_PAGES]:
+        u = lenses.month_now(u, st["today"]) if u else u        # a remembered month page that has passed -> this month
         if u and u != start and u not in st["queue"]:
             st["queue"].append(u)                         # other dance categories / calendars learned before
             st["origin"][u] = "extra"
     snap = open_page(br, result, start)
+    st["listing_opened"] += 1
     if snap and st["core"] and hasattr(br, "sitemap"):
         try:
             snap.sitemap = br.sitemap(snap.final_url, config.SITEMAP_LIMIT)
@@ -285,6 +369,7 @@ def start_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = Tru
             batch.add(ex.request_params(snap, source, st["venues"], LISTING), ("listing", result, snap, snap.final_url, h))
             result["pending"] += 1
             st["first"] = (snap, None)
+            st["first_waiting"] = True
         else:
             st["first"] = (snap, read_page(ex, snap, source, st["venues"], LISTING, use_cache))
     _spent(result, t0)
@@ -298,36 +383,24 @@ def _spent(result: dict, t0: float) -> None:
 
 
 def continue_source(br: Browser, ex: Extractor, result: dict, use_cache: bool = True, batch: Batch | None = None,
-                    max_minutes: float | None = None, stop_at: float | None = None) -> dict:
-    """Everything after the first listing page: more listing pages, then the production pages.
+                    max_minutes: float | None = None, stop_at: float | None = None,
+                    listing_batch: Batch | None = None) -> dict:
+    """Everything after the first listing page: more listing pages, then the production pages. Called again each
+    time answers come back (it only opens what has not been opened yet).
+    batch: production pages; listing_batch: the further schedule pages (None = read them straight away).
     max_minutes: browsing time allowed for this source; stop_at: clock time after which no page is opened."""
     t0 = time.monotonic()
     source, st = result["source"], result["_state"]
     if max_minutes is not None:
         st["max_s"] = max_minutes * 60
-    venues, visited, queue = st["venues"], st["visited"], st["queue"]
     if st["first"]:
         snap, data = st["first"]
-        if data is None:                                    # the batch gave no answer: read it now
-            data = read_page(ex, snap, source, venues, LISTING, use_cache)
+        if data is None:          # the request failed in the batch (not billed): read it now
+            data = read_page(ex, snap, source, st["venues"], LISTING, use_cache)
         st["first"] = None
         handle_listing(result, snap, data, source.get("schedule_url") or source.get("website"))
-
-    # further listing pages (the dance programme, other categories, pagination, next months): answered straight away
-    max_listing = config.MAX_LISTING_PAGES_CORE if st["core"] else config.MAX_LISTING_PAGES
-    while queue and result["pages"] < max_listing:
-        if stop_at and time.time() > stop_at:
-            break
-        url = queue.pop(0)
-        if url in visited:
-            continue
-        visited.add(url)
-        snap = open_page(br, result, url)
-        if not snap:
-            continue
-        st["readable"] += 1
-        handle_listing(result, snap, read_page(ex, snap, source, venues, LISTING, use_cache), url)
     _spent(result, t0)
+    open_listings(br, ex, result, use_cache, listing_batch, stop_at)
     open_details(br, ex, result, use_cache, batch, stop_at)
     return result
 
@@ -392,9 +465,24 @@ def finalize(result: dict) -> dict:
     result["items"] = merge(result["items"])
     if len(details) > cap:
         result["notes"].append(f"only {cap} of {len(details)} production pages read")
+    why = []                                   # why a site is only partly read, kept at the front of its notes
+    if len(details) > cap:
+        why.append(f"only {cap} of {len(details)} production pages read")
+    if st["out_of_time"]:
+        why.append("out of time")
+    if result["blocked"]:
+        why.append("some pages blocked (" + ", ".join(sorted(set(result["blocked"]))) + ")")
+    if st.get("left_open"):
+        why.append(f"{st['left_open']} pages still with Claude when the run ended (picked up at the next run)")
+    elif st.get("unanswered"):
+        why.append("some pages not answered by Claude in time")
+    result["why"] = "; ".join(why)
     if result["items"]:
-        incomplete = len(details) > cap or st["out_of_time"] or result["blocked"] or st.get("unanswered")
+        incomplete = (len(details) > cap or st["out_of_time"] or result["blocked"] or st.get("unanswered")
+                      or st.get("left_open"))
         result["status"] = "partial" if incomplete else "ok"
+    elif st.get("left_open"):
+        result["status"] = "partial"            # its pages are still with Claude: nothing to judge yet
     elif result["blocked"] and not st["readable"]:
         result["status"] = "blocked"
     elif "not_published_yet" in st["statuses"]:
@@ -462,7 +550,11 @@ def coverage_checks(result: dict) -> list[str]:
     if st["core"] and result["items"] and re.search(r"(opera|ballet|theatre|theater)", source.get("kind") or "", re.I):
         last = max(it["date"] for it in result["items"])
         if dt.date.fromisoformat(last) < st["today"] + dt.timedelta(days=75):
-            out.append(f"CHECK: dates found only up to {last}; the rest of the season may not have been reached")
+            if st.get("months_empty") and st.get("month_list"):
+                # the calendar's later months were read and were empty: the house has not published further yet
+                out.append(f"published so far up to {last} (the calendar's later months are still empty)")
+            else:
+                out.append(f"CHECK: dates found only up to {last}; the rest of the season may not have been reached")
     return out
 
 
@@ -477,15 +569,21 @@ def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
         result["pending"] -= 1
         if not any(r is result for r in touched):
             touched.append(result)
-        role = LISTING if kind == "listing" else DETAIL
+        role = DETAIL if kind == "detail" else LISTING
+        key = url if kind == "detail" else snap.final_url
         if data is not None and not data.get("_truncated"):
-            db.cache_put(url, role, h, ex.model, data)
+            db.cache_put(key, role, h, ex.model, data)
         if kind == "listing":
             result["_state"]["first"] = (snap, data)        # None: read it straight away in continue_source
+            result["_state"]["first_waiting"] = False
             continue
         if data is None:
             result["_state"]["unanswered"] = True
             result["notes"].append(f"{url}: no answer from the batch; next run")
+            continue
+        if kind == "more":
+            handle_listing(result, snap, data, url)
+            result["_state"]["more"] = True                  # it may point to more pages: open them
             continue
         apply_detail(result, data, snap, url)
     return touched
@@ -612,11 +710,12 @@ def main(argv=None):
     ex = Extractor(args.model)
     if sources:
         ex.check()
+        harvest_pending(ex)
     use_batch = config.USE_BATCH and not args.no_batch
     listings, details = (Batch(ex), Batch(ex)) if use_batch else (None, None)
     job_end = started + config.JOB_MINUTES * 60
     stop_pages = job_end - config.DETAIL_RESERVE_MINUTES * 60     # no page is opened after this
-    report, results, skipped = [], [], []
+    report, results, skipped, waiting = [], [], [], []
     os.makedirs("reports", exist_ok=True)
     print(f"{len(sources)} sources due (shard {args.shard + 1}/{args.shards})"
           + (", pages read through the half-price Batch API" if use_batch else ""), flush=True)
@@ -639,19 +738,29 @@ def main(argv=None):
             traceback.print_exc()
             report.append(save_failure(res["source"], e, args, run_date))
 
-    def handle(finished):
-        """Answers came back: apply them, open any new show pages they point to, save sources that are done."""
-        for res in apply_batch(details, finished, ex):
-            st = res["_state"]
-            if st["more"] and not ex.out_of_credit:
-                st["more"] = False
-                try:
-                    open_details(br, ex, res, use_cache, details, stop_pages)
-                except Exception:
-                    traceback.print_exc()
+    def advance(res):
+        """Answers came back for this source: open whatever new pages they point to."""
+        st = res["_state"]
+        if res.get("saved") or not (st["more"] or st["first"]):
+            return
+        st["more"] = False
+        try:
+            # with the credit gone nothing new is opened, but an answer that came back is still used
+            continue_source(br, ex, res, use_cache, details,
+                            stop_at=time.time() if ex.out_of_credit else stop_pages, listing_batch=details)
+        except OutOfCredit:
+            st["unanswered"] = True
+        except Exception:
+            traceback.print_exc()
+
+    def handle(batch, finished):
+        """Answers came back: apply them, open any new pages they point to, save sources that are done."""
+        for res in apply_batch(batch, finished, ex):
+            advance(res)
             if not res["pending"]:
                 finish(res)
 
+    batches = [b for b in (listings, details) if b]
     with Browser(shots_dir="reports/screens", shots="problems") as br:
         # Round 1: open every schedule page. Unchanged pages reuse last week's reading; the rest go into one batch.
         for s in sources:
@@ -666,49 +775,151 @@ def main(argv=None):
             except Exception as e:
                 traceback.print_exc()
                 report.append(save_failure(s, e, args, run_date))
-        if listings and listings.requests:
-            apply_batch(listings, listings.run(deadline=min(started + config.LISTING_BATCH_MINUTES * 60, job_end)), ex)
+        try:
+            if listings and listings.requests:
+                # wait for the schedule pages (up to LISTING_BATCH_MINUTES); any still running stay open and are
+                # picked up in the loops below as they finish
+                apply_batch(listings, listings.run(deadline=min(started + config.LISTING_BATCH_MINUTES * 60, job_end)), ex)
 
-        # Round 2: more listing pages, then the production pages. Those go out in small batches while browsing
-        # continues, and every source is saved as soon as its own pages are answered.
-        last_sent = time.time()
-        for res in results:
-            s, first = res["source"], res["_state"]["first"]
-            if ex.out_of_credit and first and first[1] is None:
-                skipped.append(s)                    # schedule page never read: leave the source due, untouched
-                res["saved"] = True
-                continue
-            print(f"=> {s['name']}", flush=True)
-            try:
-                continue_source(br, ex, res, use_cache, details,
-                                stop_at=time.time() if ex.out_of_credit else stop_pages)
-            except OutOfCredit:
-                res["_state"]["unanswered"] = True
-            except Exception as e:
-                traceback.print_exc()
-                res["saved"] = True
-                report.append(save_failure(s, e, args, run_date))
-                continue
-            if not res["pending"]:
-                finish(res)
-            if details:
-                if details.unsent >= config.BATCH_SEND_AT or (details.unsent and time.time() - last_sent > config.BATCH_SEND_EVERY_S):
+            # Round 2: the further schedule pages and the production pages, all at half price through the batch.
+            # They go out in bundles while browsing continues; answers that point to more pages open them in turn,
+            # and every source is saved as soon as its own pages are answered.
+            last_sent = time.time()
+            for res in results:
+                s, st = res["source"], res["_state"]
+                if st["first_waiting"] or res.get("saved"):
+                    continue                         # its schedule page is still with Claude: handled when it returns
+                if ex.out_of_credit and st["first"] and st["first"][1] is None:
+                    skipped.append(s)                # schedule page never read: leave the source due, untouched
+                    res["saved"] = True
+                    continue
+                print(f"=> {s['name']}", flush=True)
+                try:
+                    continue_source(br, ex, res, use_cache, details,
+                                    stop_at=time.time() if ex.out_of_credit else stop_pages, listing_batch=details)
+                except OutOfCredit:
+                    st["unanswered"] = True
+                except Exception as e:
+                    traceback.print_exc()
+                    res["saved"] = True
+                    report.append(save_failure(s, e, args, run_date))
+                    continue
+                if not res["pending"]:
+                    finish(res)
+                if details:
+                    if details.unsent >= config.BATCH_SEND_AT or (details.unsent and time.time() - last_sent > config.BATCH_SEND_EVERY_S):
+                        details.submit()
+                        last_sent = time.time()
+                    for b in batches:
+                        handle(b, b.poll())
+
+            # Wait for the last answers (they may open more pages), saving sources as they complete.
+            while any(b.busy for b in batches) and time.time() < job_end:
+                if details and details.unsent:
                     details.submit()
-                    last_sent = time.time()
-                handle(details.poll())
-
-        # Wait for the last answers, saving sources as they complete.
-        while details and details.busy:
-            handle(details.wait(deadline=job_end, until_any=True))
+                got = False
+                for b in batches:
+                    finished = b.poll(force=True)
+                    if finished:
+                        got = True
+                        handle(b, finished)
+                if not got and any(b.busy for b in batches):
+                    time.sleep(Batch.POLL_S)
+        finally:
+            # Anything still with Claude stays there (it is paid for): remember it, the next run picks it up.
+            left_open(batches, ex)
         for res in results:
+            st = res["_state"]
+            if not res.get("saved") and st["first"] and st["first"][1] is None:
+                res["saved"] = True                  # its schedule page never came back: leave the source due, untouched
+                waiting.append(res["source"])
+                continue
             finish(res)
 
+    for s in waiting:
+        report.append({"source": s["name"], "status": "not read", "performances": 0, "staged": 0, "pages": 0,
+                       "reused": 0, "check": False, "blocked": [], "cookies": [], "screens": [], "minutes": 0,
+                       "notes": ["its schedule page was still with Claude when the run ended; it stays due and the "
+                                 "answer is picked up at the next run"]})
     for s in skipped:
         report.append({"source": s["name"], "status": "not read", "performances": 0, "staged": 0, "pages": 0,
                        "reused": 0, "check": False, "blocked": [], "cookies": [], "screens": [], "minutes": 0,
                        "notes": ["the Anthropic credit ran out before this source; it stays due for the next run"]})
     write_report(report, ex, args, [b for b in (listings, details) if b], credit_out=ex.out_of_credit)
     return 0
+
+
+def left_open(batches: list, ex: Extractor) -> None:
+    """Pages still being answered when the run ends: their sources are saved with what they have (and looked at
+    again next run), and the pages are recorded so the next run collects the answers instead of paying again."""
+    rows = {}
+    for b in batches:
+        for key in b.drop_unsent():
+            ctx = b.context.pop(key, None)
+            if ctx is not None:
+                ctx[1]["pending"] -= 1
+                ctx[1]["_state"]["unanswered"] = True
+        for bid, keys in b.leave_open().items():
+            for key in keys:
+                ctx = b.context.pop(key, None)
+                if ctx is None:
+                    continue
+                kind, result, snap, url, h = ctx
+                result["pending"] -= 1
+                st = result["_state"]
+                st["left_open"] = st.get("left_open", 0) + 1
+                st["first_waiting"] = False
+                row = {"url": url if kind == "detail" else snap.final_url, "role": DETAIL if kind == "detail" else LISTING,
+                       "text_hash": h, "model": ex.model, "batch_id": bid, "custom_id": key}
+                rows[(row["url"], row["role"])] = row          # one row per page (the table's key)
+    if rows:
+        print(f"{len(rows)} pages still with Claude at the end of the run: kept for the next run", flush=True)
+        db.pending_put(list(rows.values()))
+
+
+def harvest_pending(ex: Extractor) -> int:
+    """Collect the answers to pages left with the Batch API by earlier runs and store them as readings, so this
+    run reuses them for free when the page has not changed. Returns how many readings were stored."""
+    rows = db.pending_all()
+    if not rows:
+        return 0
+    by_batch: dict[str, list[dict]] = {}
+    for r in rows:
+        by_batch.setdefault(r["batch_id"] or "", []).append(r)
+    stored = 0
+    now = dt.datetime.now(dt.timezone.utc)
+    for bid, items in by_batch.items():
+        try:
+            age = max((now - dt.datetime.fromisoformat(r["updated_at"])).days for r in items if r.get("updated_at"))
+        except Exception:
+            age = 0
+        got = None
+        try:
+            if bid and ex.client.messages.batches.retrieve(bid).processing_status != "ended":
+                if age < 30:
+                    continue                          # still running: next time
+            elif bid:
+                got = {e.custom_id: e for e in ex.client.messages.batches.results(bid)}
+        except Exception as e:
+            gone = any(w in str(e).lower() for w in ("not_found", "not found", "404", "expired"))
+            if not gone and age < 30:
+                print(f"pending batch {bid}: {type(e).__name__}; trying again next run", flush=True)
+                continue
+        readings = []
+        for r in items:
+            entry = (got or {}).get(r["custom_id"])
+            if entry is not None and entry.result.type == "succeeded":
+                data = ex.parse(entry.result.message)
+                if not data.get("_truncated"):
+                    readings.append((r["url"], r["role"], r["text_hash"], r["model"], data))
+        for reading in readings:
+            db.cache_put(*reading)
+        stored += len(readings)
+        for r in items:
+            db.pending_done(r["url"], r["role"])
+    if stored:
+        print(f"{stored} answers left by earlier runs collected (reused for free when the page is unchanged)", flush=True)
+    return stored
 
 
 def credit_stop(res: dict) -> None:
@@ -725,12 +936,14 @@ def save(res: dict, args, run_date: str) -> dict:
     s = res["source"]
     rows = to_staging(res, run_date)
     staged = 0 if args.dry else db.stage(rows)
-    days = 0 if res.get("retry_soon") else recheck_days(s, len(rows), res.get("runs"), res["_state"]["today"])
+    days = 0 if res.get("retry_soon") or res["_state"].get("left_open") or res["_state"].get("unanswered") else \
+        recheck_days(s, len(rows), res.get("runs"), res["_state"]["today"])
     fields = {
         "status": res["status"],
         "next_check_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).isoformat(),
         "notes": ((s.get("notes") or "").split(" || last run:")[0]
                   + f" || last run: {run_date}, {len(rows)} performances, {res['pages']} pages"
+                  + (f", partial because: {res['why']}" if res["status"] == "partial" and res.get("why") else "")
                   + (f", {'; '.join(res['notes'])[:300]}" if res["notes"] else "")),
     }
     if res["schedule_url"] and not s.get("schedule_url"):
@@ -749,7 +962,10 @@ def save(res: dict, args, run_date: str) -> dict:
              "pages": res["pages"], "reused": res.get("reused", 0), "check": res["check"],
              "upcoming_before": res.get("upcoming_before"), "blocked": sorted(set(res["blocked"])),
              "cookies": sorted(set(res["cookies"])), "screens": res["screens"][:5],
-             "minutes": res.get("minutes", 0), "notes": res["notes"][:4], "coverage": res.get("coverage", []),
+             "minutes": res.get("minutes", 0),
+             "notes": ([f"PARTIAL because: {res['why']}"] if res["status"] == "partial" and res.get("why") else [])
+                      + res["notes"][:4],
+             "coverage": res.get("coverage", []),
              "runs": [{"title": r["title"], "venue": r.get("venue"), "start": r.get("start"), "end": r.get("end"),
                        "found": r["found"], "expected": r.get("expected"), "status": r["status"],
                        "lenses": r.get("lenses") or []} for r in res.get("runs") or []],
