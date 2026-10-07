@@ -124,8 +124,8 @@ def test_main_flow_applies_only_confident_verdicts(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages"])
     assert review.main() == 0
     names = [c[0] for c in calls]
-    assert names[:4] == ["refresh_source_venues", "promote_staging_performances", "review_housekeeping",
-                         "find_duplicate_candidates"]
+    assert names[:5] == ["refresh_source_venues", "promote_staging_performances", "review_housekeeping",
+                         "refresh_evening_groups", "find_duplicate_candidates"]
     applied = [c[1] for c in calls if c[0] == "apply_review"]
     assert applied[0]["p_verdict"] == "same" and applied[0]["p_keep"] == "A"
     assert applied[1]["p_verdict"] == "unsure"            # 0.5 confidence: left for a person

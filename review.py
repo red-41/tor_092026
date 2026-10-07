@@ -268,6 +268,10 @@ def main() -> int:
         print("published:", report["published"])
     if not a.dry:
         report["housekeeping"] = db.rpc("review_housekeeping")
+        try:                                     # the evening groups follow each row change by trigger; this is the safety net
+            report["evening_groups"] = db.rpc("refresh_evening_groups")
+        except Exception as e:
+            print("refresh_evening_groups:", str(e)[:200])
         report["new_pairs"] = db.rpc("find_duplicate_candidates", {"p_run": run})
         print("housekeeping:", report["housekeeping"], "new pairs:", report["new_pairs"])
 
