@@ -25,8 +25,10 @@ import time
 
 import httpx
 
+import budget
 import config
 import db
+from extract import tool_choice
 
 PUBLISH_CHUNK = 40           # staging rows per database call (made smaller by itself if a call runs too long)
 MIN_CONFIDENCE = float(os.environ.get("REVIEW_MIN_CONFIDENCE", "0.85"))
@@ -178,19 +180,44 @@ def case_words(case: dict) -> list[str]:
 
 # ---------- Claude ----------
 
-def ask(client, model: str, case: dict, pages: dict[str, str]) -> dict:
+def ask(client, model: str, case: dict, pages: dict[str, str], pay=None) -> dict:
+    """One case to one model, paid from the spending cap (raises budget.BudgetReached at the cap)."""
     evidence = json.dumps(case, ensure_ascii=False, default=str, indent=1)
     page_part = "\n\n".join(f"Page {u}:\n{t}" for u, t in pages.items() if t) or "(no page text could be read)"
     user = (f"Today: {dt.date.today().isoformat()}\nCase:\n{evidence}\n\n"
             f"Text of the listing pages (the parts around the title):\n{page_part}")
-    resp = client.messages.create(
-        model=model, max_tokens=1500, tools=[TOOL], tool_choice={"type": "tool", "name": "record_verdict"},
-        system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user}])
+    params = dict(model=model, max_tokens=1500, tools=[TOOL], tool_choice=tool_choice(model, "record_verdict"),
+                  system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                  messages=[{"role": "user", "content": user}])
+    pay = pay or budget.NoBudget()
+    est = budget.estimate_request(params)
+    pay.spend(est)
+    try:
+        resp = client.messages.create(**params)
+    except Exception:
+        pay.answered(est, 0.0)
+        raise
+    pay.answered(est, budget.usage_cost(model, resp.usage))
     for block in resp.content:
         if block.type == "tool_use":
             return dict(block.input)
     return {"verdict": "unsure", "confidence": 0, "reason": "no answer"}
+
+
+def decide(client, case: dict, pages: dict[str, str], pay=None) -> dict:
+    """The first model decides; a verdict it is not sure of (below MIN_CONFIDENCE) gets a second look by the
+    stronger model, whose answer then counts."""
+    v = ask(client, config.MODEL, case, pages, pay)
+    second = config.ESCALATE_MODEL
+    if second and second != config.MODEL and (v.get("verdict") == "unsure"
+                                                or float(v.get("confidence") or 0) < MIN_CONFIDENCE):
+        try:
+            v2 = ask(client, second, case, pages, pay)
+            v2["reason"] = (v2.get("reason") or "") + " [second look]"
+            return v2
+        except budget.BudgetReached:
+            pass
+    return v
 
 
 def to_call(case: dict, v: dict) -> dict:
@@ -283,7 +310,8 @@ def main() -> int:
     client = None
     if cases:
         import anthropic
-        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=8, timeout=300)
+        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=3, timeout=300)
+    pay = budget.Budget(part="review") if (cases and config.SUPABASE_URL) else budget.NoBudget()
 
     tally: dict[str, int] = {}
     for case in cases:
@@ -292,7 +320,10 @@ def main() -> int:
             break
         pages = {} if a.no_pages else {u: around(page_text(u), case_words(case)) for u in case_urls(case)}
         try:
-            v = ask(client, config.MODEL, case, pages)
+            v = decide(client, case, pages, pay)
+        except budget.BudgetReached as e:
+            print("spending cap:", str(e)[:300], "- the rest waits for the next run")
+            break
         except Exception as e:                      # credit, network: stop asking, keep what is done
             print("Claude call failed:", str(e)[:300])
             break
@@ -308,7 +339,9 @@ def main() -> int:
                                 "result": result})
         print(f"{case['kind']:8} {case['id']}: {v.get('verdict')} ({v.get('confidence')}) -> {result}")
 
+    pay.close()
     report["tally"] = tally
+    report["spent"] = pay.summary()
     out = pathlib.Path("reports")
     out.mkdir(exist_ok=True)
     (out / f"review-{run}.json").write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str))

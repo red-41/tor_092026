@@ -21,11 +21,13 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import budget
 import config
 import db
 import lenses
 from browse import Browser
-from extract import Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash, runs_of, time_seen
+from extract import (Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash, retarget, runs_of,
+                     time_seen)
 
 THIN = 150          # characters: below this a page has nothing to read
 
@@ -34,18 +36,86 @@ LISTING = "schedule or listing page"
 DETAIL = "production page with dates and cast"
 
 
+def cache_models(ex: Extractor) -> set:
+    """Readings reused for an unchanged page: this run's model and the stronger ones."""
+    return set(config.CACHE_MODELS) | {ex.model}
+
+
 def read_page(ex: Extractor, snap, source: dict, venues: list, role: str, use_cache: bool, key: str | None = None) -> dict:
-    """Claude's reading of a page, reusing last time's reading when the page has not changed."""
+    """Claude's reading of a page, reusing last time's reading when the page has not changed. A doubtful first
+    reading gets a second look by the stronger model (see second_look)."""
     key = key or snap.final_url
     h = page_hash(snap)
+    if getattr(ex, "compare", None):
+        return compare_read(ex, snap, source, venues, role, key, h)
     if use_cache:
-        hit = db.cache_get(key, role, h, ex.model)
+        hit = db.cache_get(key, role, h, cache_models(ex))
         if hit is not None:
             ex.cache_hits += 1
             return hit
     data = ex.read(snap, source, venues, role=role)
+    why = second_look(ex, data, key, role)
+    if why:
+        try:
+            better = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
+            ex.escalations += 1
+            better["_second_look"] = why
+            data = better
+        except OutOfCredit:
+            pass                              # no budget left for a second look: keep the first reading
     if not data.get("_truncated"):
-        db.cache_put(key, role, h, ex.model, data)
+        db.cache_put(key, role, h, data.get("_model") or ex.model, data)
+    return data
+
+
+def count_upcoming(data: dict | None, today: dt.date | None = None) -> int:
+    """Dated performances from today on in a reading."""
+    if not isinstance(data, dict):
+        return 0
+    today_s = (today or dt.date.today()).isoformat()
+    return sum(1 for p in flatten(data) if isinstance(p.get("date"), str) and p["date"] >= today_s)
+
+
+def second_look(ex: Extractor, data: dict | None, key: str, role: str) -> str | None:
+    """Why the first reading of a page should be checked by the stronger model, or None.
+    Only for the first model's readings, and for at most ESCALATE_MAX_SHARE of the pages answered in this job."""
+    em = getattr(ex, "escalate_model", None)
+    if not em or not isinstance(data, dict) or data.get("_second_look") or (data.get("_model") or ex.model) == em:
+        return None
+    ex.answered += 1
+    if ex.escalations >= max(3, config.ESCALATE_MAX_SHARE * ex.answered):
+        return None
+    if data.get("_truncated"):
+        return "answer cut off"
+    if data.get("unsure"):
+        return "unsure: " + str(data["unsure"])[:100]
+    n = count_upcoming(data)
+    prev = db.cache_peek(key, role)
+    p = count_upcoming((prev or {}).get("result"))
+    if p >= config.ESCALATE_DROP_MIN and n < p * config.ESCALATE_DROP:
+        return f"found {n} shows, {p} at the last reading"
+    return None
+
+
+def compare_read(ex: Extractor, snap, source: dict, venues: list, role: str, key: str, h: str) -> dict:
+    """--compare: read the page with the model under test, put the reference reading next to it (the earlier
+    reading of the same page text by a stronger model from the cache, else a fresh one while the allowance
+    lasts) and record both. The run follows the tested model's answer."""
+    data = ex.read(snap, source, venues, role=role)
+    ref, ref_model, from_cache, ref_usage = None, None, False, None
+    prev = db.cache_peek(key, role)
+    if prev and prev.get("text_hash") == h and prev.get("model") in config.COMPARE_REF_MODELS:
+        ref, ref_model, from_cache = prev.get("result"), prev.get("model"), True
+    elif ex.compare_fresh_left > 0 and ex.escalate_model:
+        ex.compare_fresh_left -= 1
+        ref = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
+        ref_model, ref_usage = ex.escalate_model, ref.pop("_usage", None)
+    s = source
+    db.compare_put({"run_id": ex.pay.run_id if hasattr(ex.pay, "run_id") else None, "source_id": s.get("id"),
+                    "source_name": s.get("name"), "tier": s.get("priority"), "url": key, "role": role,
+                    "text_hash": h, "model": data.get("_model") or ex.model,
+                    "result": {k: v for k, v in data.items() if k != "_usage"}, "usage": data.get("_usage"),
+                    "ref_model": ref_model, "ref_result": ref, "ref_usage": ref_usage, "ref_from_cache": from_cache})
     return data
 
 
@@ -65,13 +135,12 @@ def reusable(prev: dict | None, today: dt.date) -> bool:
             dates.append(dt.date.fromisoformat((p.get("date") or "").strip()))
         except ValueError:
             pass
-    if not dates:
-        return False                      # no dates known yet: look again, they may be out now
     if runs_of(prev["result"]) or _short_of_expected(prev["result"]):
         return False                      # some dates were missing last time: look again, they may be out now
     future = [d for d in dates if d >= today]
     if not future:
-        return True                       # the run is over
+        # no upcoming date (none published yet, or the run is over): look again after two weeks
+        return age.days < config.DETAIL_NODATE_DAYS
     return min(future) > today + dt.timedelta(days=config.DETAIL_SOON_DAYS)
 
 
@@ -123,12 +192,103 @@ def apply_detail(result: dict, data: dict, snap, url: str) -> None:
         r["detail_url"] = r.get("detail_url") or url
         add_run(result, r, lens or ("listing" if url == "listing" else "production page"))
         hunt(result, r)
+    note_announcement(st, data, url)
     if data.get("page_status") == "listing_without_dates" and url not in st["deep"]:
-        new = [u for u in (data.get("detail_links") or []) if isinstance(u, str) and u not in st["details"]]
+        new = add_details(st, data.get("detail_links") or [])
         if new:
-            st["details"] += new
             st["deep"].update(new)
             st["more"] = True
+
+
+def add_details(st: dict, links) -> list[str]:
+    """Queue production pages not queued yet; the same page under another address (another language, a trailing
+    slash, tracking parameters) is read once."""
+    keys = st.setdefault("detail_keys", {lenses.page_key(u) for u in st["details"]})
+    new = []
+    for u in links or []:
+        if not isinstance(u, str) or not u.startswith("http") or u in st["details"]:
+            continue
+        k = lenses.page_key(u)
+        if k in keys:
+            st["same_page"] = st.get("same_page", 0) + 1
+            continue
+        keys.add(k)
+        st["details"].append(u)
+        new.append(u)
+    return new
+
+
+def note_listing(st: dict, data: dict) -> None:
+    """What the schedule pages already say about each production page they link: its upcoming dates, whether every
+    one has a start time, whether a run is incomplete, and whether the choreographer is named."""
+    info = st.setdefault("listing_info", {})
+    today = st["today"].isoformat()
+    for prod in (data.get("productions") or []):
+        if not isinstance(prod, dict) or not isinstance(prod.get("detail_url"), str):
+            continue
+        k = lenses.page_key(prod["detail_url"])
+        cur = info.setdefault(k, {"title": str(prod.get("work") or prod.get("title") or "").strip().lower(),
+                                  "dates": 0, "untimed": 0, "runs": False, "credits": False})
+        for perf in (prod.get("performances") or []):
+            if isinstance(perf, dict) and isinstance(perf.get("date"), str) and perf["date"] >= today:
+                cur["dates"] += 1
+                if not str(perf.get("time") or "").strip():
+                    cur["untimed"] += 1
+        if prod.get("runs"):
+            cur["runs"] = True
+        if str(prod.get("choreographer") or "").strip():
+            cur["credits"] = True
+        if not cur["title"]:
+            cur["title"] = str(prod.get("work") or prod.get("title") or "").strip().lower()
+
+
+def _credits_in(reading: dict | None) -> bool:
+    prods = (reading or {}).get("productions") if isinstance(reading, dict) else None
+    return any(str(p.get("choreographer") or "").strip() for p in (prods if isinstance(prods, list) else [])
+               if isinstance(p, dict))
+
+
+def redundant(result: dict, url: str, prev: dict | None) -> str | None:
+    """A production page that would add nothing: the schedule already gives every upcoming date of it with a start
+    time, no run of it is incomplete, and its choreographer is known (from the schedule or from the last reading of
+    this page). If only the credits are missing, one page per production is read. Touring companies' pages are
+    always read (their production pages often hold tour dates the calendar does not)."""
+    if re.search(r"company", result["source"].get("kind") or "", re.I):
+        return None
+    st = result["_state"]
+    info = st.get("listing_info", {}).get(lenses.page_key(url))
+    if not info or not info["dates"] or info["untimed"] or info["runs"]:
+        return None
+    if info["credits"] or _credits_in((prev or {}).get("result")):
+        return "schedule already gives every date, time and the credits"
+    title = info["title"]
+    if title:
+        opened = st.setdefault("credit_pages", set())
+        if title in opened:
+            return "another page of this production is read for its credits"
+        opened.add(title)
+    return None
+
+
+def note_announcement(st: dict, data: dict, url: str) -> None:
+    """'The 2027/28 season will be announced on 3 March 2027': remember the date (the source is looked at again the
+    day after). Only dates from tomorrow to about a year ahead count."""
+    a = data.get("announcement")
+    if not isinstance(a, dict):
+        return
+    when = None
+    for field, fmt in (("date", "%Y-%m-%d"), ("month", "%Y-%m")):
+        v = (a.get(field) or "").strip()
+        if v:
+            try:
+                when = dt.datetime.strptime(v[: len(fmt) + 2], fmt).date()
+                break
+            except ValueError:
+                continue
+    if when is None or not (st["today"] < when <= st["today"] + dt.timedelta(days=400)):
+        return
+    st.setdefault("announcements", []).append({"date": when.isoformat(), "what": str(a.get("what") or "")[:80],
+                                               "quote": str(a.get("quote") or "")[:200], "url": url})
 
 
 def _run_key(result: dict, r: dict) -> str:
@@ -226,8 +386,9 @@ def handle_listing(result: dict, snap, data: dict, url: str | None = None) -> No
             result["items"].append(c)
             st["listing_dates"].append(c["date"])
             found += 1
-    new_details = [u for u in data.get("detail_links", []) if isinstance(u, str) and u not in st["details"]]
-    st["details"] += new_details
+    note_listing(st, data)
+    note_announcement(st, data, url)
+    new_details = add_details(st, data.get("detail_links", []))
     if st["origin"].get(url) == "listing_link" and (found or new_details):
         st["learned"].append(url)                        # another dance category that pays off: keep it as a start page
     for u in (data.get("listing_links") or [])[:4]:
@@ -413,16 +574,21 @@ def open_details(br: Browser, ex: Extractor, result: dict, use_cache: bool = Tru
     t0 = time.monotonic()
     try:
         while True:
-            todo = [u for u in st["details"][: st["cap"]] + st["hunt_queue"] if u not in st["visited"]]
+            cap = st["cap"] + st.get("redundant", 0)        # pages skipped as redundant do not use up the cap
+            todo = [u for u in st["details"][:cap] + st["hunt_queue"] if u not in st["visited"]]
             if not todo:
                 return
             for url in todo:
-                if use_cache and url not in st["hunt"]:
-                    prev = db.cache_peek(url, DETAIL)
-                    if reusable(prev, st["today"]):      # read before, next show not soon: no need to open it
+                if url not in st["hunt"]:
+                    prev = db.cache_peek(url, DETAIL) if use_cache else None
+                    if use_cache and reusable(prev, st["today"]):   # read before, next show not soon: no need to open it
                         st["visited"].add(url)
                         result["reused"] += 1
                         apply_detail(result, prev["result"], None, url)
+                        continue
+                    if redundant(result, url, prev):              # the schedule already says everything it would
+                        st["visited"].add(url)
+                        st["redundant"] = st.get("redundant", 0) + 1
                         continue
                 if st["browse_s"] + (time.monotonic() - t0) > limit_s or (stop_at and time.time() > stop_at):
                     if not st["out_of_time"]:
@@ -461,8 +627,9 @@ def collect_source(br: Browser, ex: Extractor, source: dict, use_cache: bool = T
 def finalize(result: dict) -> dict:
     """Merge, decide the status and compare with what Saffitt already has."""
     source, st = result["source"], result["_state"]
-    details, cap = st["details"], st["cap"]
-    result["items"] = merge(result["items"])
+    details, cap = st["details"], st["cap"] + st.get("redundant", 0)
+    result["items"] = merge(fill_from_siblings(result["items"]))
+    result["skipped_pages"] = st.get("redundant", 0) + st.get("same_page", 0)
     if len(details) > cap:
         result["notes"].append(f"only {cap} of {len(details)} production pages read")
     why = []                                   # why a site is only partly read, kept at the front of its notes
@@ -508,6 +675,25 @@ def finalize(result: dict) -> dict:
     for c in reversed(result["coverage"]):
         result["notes"].insert(at, c)
     return result
+
+
+def fill_from_siblings(items: list[dict]) -> list[dict]:
+    """Dates of one production found on the schedule without its choreographer, description or image take them from
+    another date of the same production on the same site that has them (one production page read for its credits
+    serves all its dates)."""
+    best: dict = {}
+    for it in items:
+        k = ((it["title"] or "").lower(), (it.get("company") or "").lower(), (it.get("venue") or "").lower())
+        cur = best.setdefault(k, {})
+        for f in ("choreographer", "description", "image_url"):
+            if it.get(f) and not cur.get(f):
+                cur[f] = it[f]
+    for it in items:
+        k = ((it["title"] or "").lower(), (it.get("company") or "").lower(), (it.get("venue") or "").lower())
+        for f, v in best.get(k, {}).items():
+            if not it.get(f):
+                it[f] = v
+    return items
 
 
 def _same_place(a: str | None, b: str | None) -> bool:
@@ -559,20 +745,37 @@ def coverage_checks(result: dict) -> list[str]:
 
 
 def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
-    """Hand batch answers back to their sources. Returns the sources that got answers."""
+    """Hand batch answers back to their sources. A doubtful first reading is sent again, to the stronger model, in
+    the same batch (the source keeps waiting for it). Returns the sources that got answers."""
     touched = []
     for key, data in finished:
         ctx = batch.context.pop(key, None)
         if ctx is None:
+            batch.forget(key)
             continue
         kind, result, snap, url, h = ctx
+        role = DETAIL if kind == "detail" else LISTING
+        ckey = url if kind == "detail" else snap.final_url
+        if data is not None:
+            why = second_look(ex, data, ckey, role)
+            params = batch.take_params(key) if why else None
+            if params is not None:
+                retarget(params, ex.escalate_model)
+                try:
+                    nk = batch.add(params, ctx)          # same source, same page: it keeps waiting for this answer
+                    batch.second[nk] = why
+                    ex.escalations += 1
+                    continue
+                except OutOfCredit:
+                    pass                                  # no budget left for a second look: keep the first reading
+            if key in batch.second:
+                data["_second_look"] = batch.second.pop(key)
+        batch.forget(key)
         result["pending"] -= 1
         if not any(r is result for r in touched):
             touched.append(result)
-        role = DETAIL if kind == "detail" else LISTING
-        key = url if kind == "detail" else snap.final_url
         if data is not None and not data.get("_truncated"):
-            db.cache_put(key, role, h, ex.model, data)
+            db.cache_put(ckey, role, h, data.get("_model") or ex.model, data)
         if kind == "listing":
             result["_state"]["first"] = (snap, data)        # None: read it straight away in continue_source
             result["_state"]["first_waiting"] = False
@@ -702,15 +905,36 @@ def main(argv=None):
     ap.add_argument("--no-cache", action="store_true", help="send every page to Claude even if unchanged")
     ap.add_argument("--no-batch", action="store_true", help="answer every page straight away (full price)")
     ap.add_argument("--dry", action="store_true", help="read and report only; write nothing to staging or sources")
+    ap.add_argument("--compare", type=int, metavar="N",
+                    help="model test on a mixed sample of N sources: read with MODEL, record the stronger model's "
+                         "reading of the same pages next to it (model_comparison); writes nothing to the site")
     args = ap.parse_args(argv)
 
     run_date = dt.date.today().isoformat()
     use_cache = not args.no_cache
-    sources = db.due_sources(args.limit, args.priority, args.name, args.shard, args.shards, status=args.status)
+    # every request is paid from the shared spending cap (no database in tests: no cap)
+    pay = (budget.Budget(part="compare" if args.compare else "collect", shard=args.shard)
+           if config.SUPABASE_URL else budget.NoBudget())
+    if args.compare:
+        args.dry, use_cache, args.no_batch = True, False, True
+        for t in list(config.DETAIL_CAP):
+            config.DETAIL_CAP[t] = min(config.DETAIL_CAP[t], config.COMPARE_DETAIL_CAP)
+        config.MAX_LISTING_PAGES_CORE = min(config.MAX_LISTING_PAGES_CORE, 6)
+        config.HUNT_PAGES = min(config.HUNT_PAGES, 2)
+        sources = db.compare_sources(args.compare)[args.shard::max(1, args.shards)]   # the sample dealt over jobs
+    else:
+        sources = db.due_sources(args.limit, args.priority, args.name, args.shard, args.shards, status=args.status)
     ex = Extractor(args.model)
-    if sources:
+    ex.budget = pay
+    if args.compare:
+        ex.compare, ex.compare_fresh_left = True, config.COMPARE_FRESH_MAX
+    if sources and not pay.open():
+        ex.stop(pay.stopped or "the spending cap is reached", capped=True)
+        print(f"Nothing is sent to Claude: {ex.stop_note}. The sources stay due.", flush=True)
+    elif sources:
         ex.check()
-        harvest_pending(ex)
+        if not args.compare:
+            harvest_pending(ex)
     use_batch = config.USE_BATCH and not args.no_batch
     listings, details = (Batch(ex), Batch(ex)) if use_batch else (None, None)
     job_end = started + config.JOB_MINUTES * 60
@@ -719,6 +943,16 @@ def main(argv=None):
     os.makedirs("reports", exist_ok=True)
     print(f"{len(sources)} sources due (shard {args.shard + 1}/{args.shards})"
           + (", pages read through the half-price Batch API" if use_batch else ""), flush=True)
+    beat = {"t": time.time()}
+
+    def heartbeat():
+        """A status line every 10 minutes, so a run that hangs shows where."""
+        if time.time() - beat["t"] < 600:
+            return
+        beat["t"] = time.time()
+        waiting_pages = sum(len(k) for b in (listings, details) if b for k in b._open.values())
+        print(f"[{(time.time() - started) / 60:.0f} min] {len(report)} sources saved, {len(results)} started, "
+              f"{waiting_pages} pages with Claude, spent {pay.summary()}", flush=True)
 
     def finish(res):
         """Save a source whose pages are all answered (or given up on)."""
@@ -726,7 +960,7 @@ def main(argv=None):
             return
         res["saved"] = True
         if ex.out_of_credit and (res["_state"].get("unanswered") or res["_state"]["out_of_time"]):
-            credit_stop(res)
+            credit_stop(res, getattr(ex, "capped", False))
             if not res["items"]:
                 skipped.append(res["source"])     # nothing found yet: leave the source due, untouched
                 return
@@ -806,17 +1040,22 @@ def main(argv=None):
                     continue
                 if not res["pending"]:
                     finish(res)
+                heartbeat()
                 if details:
                     if details.unsent >= config.BATCH_SEND_AT or (details.unsent and time.time() - last_sent > config.BATCH_SEND_EVERY_S):
                         details.submit()
                         last_sent = time.time()
+                    if listings and listings.unsent:
+                        listings.submit()            # second looks of schedule pages
                     for b in batches:
                         handle(b, b.poll())
 
             # Wait for the last answers (they may open more pages), saving sources as they complete.
             while any(b.busy for b in batches) and time.time() < job_end:
-                if details and details.unsent:
-                    details.submit()
+                heartbeat()
+                for b in batches:
+                    if b.unsent:
+                        b.submit()                   # production pages, and second looks of schedule pages
                 got = False
                 for b in batches:
                     finished = b.poll(force=True)
@@ -844,7 +1083,9 @@ def main(argv=None):
     for s in skipped:
         report.append({"source": s["name"], "status": "not read", "performances": 0, "staged": 0, "pages": 0,
                        "reused": 0, "check": False, "blocked": [], "cookies": [], "screens": [], "minutes": 0,
-                       "notes": ["the Anthropic credit ran out before this source; it stays due for the next run"]})
+                       "notes": [("the spending cap was reached" if getattr(ex, "capped", False)
+                                  else "the Anthropic credit ran out") + " before this source; it stays due for the next run"]})
+    pay.close()
     write_report(report, ex, args, [b for b in (listings, details) if b], credit_out=ex.out_of_credit)
     return 0
 
@@ -869,8 +1110,10 @@ def left_open(batches: list, ex: Extractor) -> None:
                 st = result["_state"]
                 st["left_open"] = st.get("left_open", 0) + 1
                 st["first_waiting"] = False
+                model, est = getattr(b, "meta", {}).pop(key, (ex.model, 0.0))   # its estimate stays in the ledger
+                b.forget(key)
                 row = {"url": url if kind == "detail" else snap.final_url, "role": DETAIL if kind == "detail" else LISTING,
-                       "text_hash": h, "model": ex.model, "batch_id": bid, "custom_id": key}
+                       "text_hash": h, "model": model, "batch_id": bid, "custom_id": key, "estimate": est}
                 rows[(row["url"], row["role"])] = row          # one row per page (the table's key)
     if rows:
         print(f"{len(rows)} pages still with Claude at the end of the run: kept for the next run", flush=True)
@@ -910,8 +1153,14 @@ def harvest_pending(ex: Extractor) -> int:
             entry = (got or {}).get(r["custom_id"])
             if entry is not None and entry.result.type == "succeeded":
                 data = ex.parse(entry.result.message)
+                # its estimate was paid from the cap by the run that sent it: correct it to the actual cost
+                ex.pay.answered(float(r.get("estimate") or 0),
+                                budget.usage_cost(r["model"], entry.result.message.usage, batch=True))
                 if not data.get("_truncated"):
+                    data["_model"] = r["model"]
                     readings.append((r["url"], r["role"], r["text_hash"], r["model"], data))
+            elif got is not None:
+                ex.pay.answered(float(r.get("estimate") or 0), 0.0)     # not answered: not billed
         for reading in readings:
             db.cache_put(*reading)
         stored += len(readings)
@@ -922,11 +1171,12 @@ def harvest_pending(ex: Extractor) -> int:
     return stored
 
 
-def credit_stop(res: dict) -> None:
-    """The credit ran out part way through a source: keep what was found, look again at the next run."""
+def credit_stop(res: dict, capped: bool = False) -> None:
+    """The credit (or the spending cap) ran out part way through a source: keep what was found, look again at the
+    next run."""
     res["retry_soon"] = True
     res["_state"]["unanswered"] = True
-    note = "the Anthropic credit ran out; the rest at the next run"
+    note = ("the spending cap was reached" if capped else "the Anthropic credit ran out") + "; the rest at the next run"
     if note not in res["notes"]:
         res["notes"].append(note)
 
@@ -938,6 +1188,16 @@ def save(res: dict, args, run_date: str) -> dict:
     staged = 0 if args.dry else db.stage(rows)
     days = 0 if res.get("retry_soon") or res["_state"].get("left_open") or res["_state"].get("unanswered") else \
         recheck_days(s, len(rows), res.get("runs"), res["_state"]["today"])
+    anns = announcements(res)
+    ann_fields = {}
+    if anns:
+        first = anns[0]
+        days = announcement_days(s, days, len(rows), dt.date.fromisoformat(first["date"]), res["_state"]["today"])
+        ann_fields = {"announcement_at": first["date"],
+                      "announcement_note": f"{first['what']}: {first['date']} (\"{first['quote']}\")"[:300]}
+    elif s.get("announcement_at") and str(s["announcement_at"]) < res["_state"]["today"].isoformat() \
+            and res["status"] in ("ok", "partial", "waiting", "no_dance"):
+        ann_fields = {"announcement_at": None}          # the announced day has passed and the page no longer says it
     fields = {
         "status": res["status"],
         "next_check_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).isoformat(),
@@ -946,6 +1206,7 @@ def save(res: dict, args, run_date: str) -> dict:
                   + (f", partial because: {res['why']}" if res["status"] == "partial" and res.get("why") else "")
                   + (f", {'; '.join(res['notes'])[:300]}" if res["notes"] else "")),
     }
+    fields.update(ann_fields)
     if res["schedule_url"] and not s.get("schedule_url"):
         fields["schedule_url"] = res["schedule_url"]
     learned = [u for u in res["_state"]["learned"] if u not in (s.get("extra_schedule_urls") or [])]
@@ -969,9 +1230,33 @@ def save(res: dict, args, run_date: str) -> dict:
              "runs": [{"title": r["title"], "venue": r.get("venue"), "start": r.get("start"), "end": r.get("end"),
                        "found": r["found"], "expected": r.get("expected"), "status": r["status"],
                        "lenses": r.get("lenses") or []} for r in res.get("runs") or []],
-             "learned": learned}
+             "learned": learned, "announcements": anns, "skipped_pages": res.get("skipped_pages", 0)}
     _record(s, entry, args)
     return entry
+
+
+def announcements(res: dict) -> list[dict]:
+    """The announcements found on a source's pages, earliest first, one per date and subject."""
+    seen, out = set(), []
+    for a in sorted(res["_state"].get("announcements") or [], key=lambda a: a["date"]):
+        k = (a["date"], a["what"].lower())
+        if k not in seen:
+            seen.add(k)
+            out.append(a)
+    return out
+
+
+def announcement_days(s: dict, days: int, found: int, when: dt.date, today: dt.date) -> int:
+    """Days to the next check given an announced date: with shows on now, keep the usual rhythm but look again the
+    day after the announcement if that comes first; with nothing on yet, wait for the announcement (at most 30 days
+    for tiers 0-1, ANNOUNCE_MAX_WAIT_DAYS for the others)."""
+    if not days:
+        return days                                   # a source to look at again straight away stays so
+    until = max(1, (when - today).days + 1)
+    if found:
+        return min(days, until)
+    cap = 30 if s.get("priority") in config.CORE_TIERS else config.ANNOUNCE_MAX_WAIT_DAYS
+    return min(until, cap)
 
 
 def save_failure(s: dict, e: Exception, args, run_date: str) -> dict:
@@ -989,6 +1274,8 @@ def save_failure(s: dict, e: Exception, args, run_date: str) -> dict:
 
 
 def _record(s: dict, entry: dict, args) -> None:
+    if getattr(args, "compare", None):
+        return                                  # the model test leaves no trace in the sources' history
     db.record_check({
         "kind": "collect", "source_id": s["id"], "source_name": s["name"],
         "url": s.get("schedule_url") or s.get("website"), "verdict": entry["status"],
@@ -1012,14 +1299,29 @@ def write_report(report, ex, args, batches=(), credit_out=False):
     b_out = sum(b.output_tokens for b in batches)
     lines = [f"## Saffitt collector, shard {args.shard + 1}/{args.shards}" + (" (dry run)" if args.dry else "")]
     if credit_out:
-        lines += ["", "**The Anthropic credit ran out during this run.** Everything found before that is saved. "
-                  "Sources marked 'not read' or 'credit ran out' stay due: add credit in the Console, then run again.", ""]
+        note = getattr(ex, "stop_note", "") or ""
+        why = ("the Anthropic credit ran out or the Console spend limit was reached"
+               + (f" ({note[len('Anthropic: '):][:120]})" if note.startswith("Anthropic: ") else "")
+               if not note or note.startswith("Anthropic") else note)
+        lines += ["", f"**Stopped sending pages to Claude: {why}.** Everything found before that is saved. "
+                  "Sources marked 'not read' stay due for the next run.", ""]
+    pay = getattr(ex, "budget", None)
     lines += [f"{len(report)} sources: " + ", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda x: -x[1]))
               + f". {total} performances found.",
-              f"Claude ({ex.model}): {b_calls} pages via the Batch API at half price ({b_in:,} tokens in, {b_out:,} out); "
+              f"Claude ({ex.model}, second look {getattr(ex, 'escalate_model', None) or 'off'}): "
+              f"{b_calls} pages via the Batch API at half price ({b_in:,} tokens in, {b_out:,} out); "
               f"{ex.calls} pages at full price ({ex.input_tokens:,} in, {ex.output_tokens:,} out); "
-              f"{ex.cache_hits} unchanged pages and {sum(r.get('reused', 0) for r in report)} production pages reused for free.",
+              f"{getattr(ex, 'escalations', 0)} pages given a second look; "
+              f"{ex.cache_hits} unchanged pages and {sum(r.get('reused', 0) for r in report)} production pages reused for free; "
+              f"{sum(r.get('skipped_pages', 0) for r in report)} production pages skipped as redundant.",
+              f"Spent {pay.summary() if pay is not None else 'n/a'}.",
               ""]
+    ann = [(r["source"], a) for r in report for a in r.get("announcements") or []]
+    if ann:
+        lines += ["### Announced", "| Source | What | When | Quote |", "|---|---|---|---|"]
+        for src, a in ann:
+            lines.append(f"| {src} | {a['what']} | {a['date']} | {a['quote'].replace('|', '/')[:120]} |")
+        lines.append("")
     if problems:
         lines += ["### Needs a look", "| Source | Status | Found | Already on site | Why |", "|---|---|---|---|---|"]
         for r in problems:

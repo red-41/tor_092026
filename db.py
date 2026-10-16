@@ -139,8 +139,10 @@ def rpc(name: str, params: dict | None = None, timeout: float = 600):
         return r.json() if r.content else None
 
 
-def cache_get(url: str, role: str, text_hash: str, model: str, max_age_days: int = 28) -> dict | None:
-    """Last reading of this exact page text, if it is recent and made with the same model."""
+def cache_get(url: str, role: str, text_hash: str, model, max_age_days: int = 28) -> dict | None:
+    """Last reading of this exact page text, if it is recent and made by `model` (one name or a set of names:
+    a stronger model's reading of the same text is reused too)."""
+    models = set(model) if isinstance(model, (set, frozenset, list, tuple)) else {model}
     try:
         with _client() as c:
             r = c.get("/collector_page_cache", params={"select": "text_hash,result,model,updated_at",
@@ -149,7 +151,7 @@ def cache_get(url: str, role: str, text_hash: str, model: str, max_age_days: int
                 return None
             row = r.json()[0]
         age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(row["updated_at"])
-        if row["text_hash"] == text_hash and row["model"] == model and age.days < max_age_days:
+        if row["text_hash"] == text_hash and row["model"] in models and age.days < max_age_days:
             return row["result"]
     except Exception:
         return None
@@ -178,7 +180,8 @@ def pending_put(rows: list[dict]) -> None:
         return
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     body = [{"url": r["url"], "role": PENDING + r["role"], "text_hash": r["text_hash"], "model": r["model"],
-             "result": {"batch_id": r["batch_id"], "custom_id": r["custom_id"]}, "updated_at": now} for r in rows]
+             "result": {"batch_id": r["batch_id"], "custom_id": r["custom_id"], "estimate": r.get("estimate") or 0},
+             "updated_at": now} for r in rows]
     try:
         with _client() as c:
             for i in range(0, len(body), 200):
@@ -207,7 +210,7 @@ def pending_all() -> list[dict]:
                     break
             return [{"url": x["url"], "role": x["role"][len(PENDING):], "text_hash": x["text_hash"], "model": x["model"],
                      "batch_id": (x["result"] or {}).get("batch_id"), "custom_id": (x["result"] or {}).get("custom_id"),
-                     "updated_at": x["updated_at"]} for x in rows]
+                     "estimate": (x["result"] or {}).get("estimate") or 0, "updated_at": x["updated_at"]} for x in rows]
     except Exception:
         return []
 
@@ -286,3 +289,39 @@ def upsert_runs(rows: list[dict]) -> None:
                    headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
     except Exception:
         pass
+
+
+def compare_put(row: dict) -> None:
+    """One page read by the model under test, with the reference reading (run.py --compare)."""
+    try:
+        with _client() as c:
+            r = c.post("/model_comparison", json=row, headers={"Prefer": "return=minimal"})
+            if r.status_code >= 400:
+                print(f"could not record a comparison: {r.status_code} {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"could not record a comparison: {e}", flush=True)
+
+
+def compare_sources(n: int, per_tier: dict | None = None) -> list[dict]:
+    """A mixed sample for the model comparison: sources read in the last weeks (their pages have a reference
+    reading in the cache), spread over tiers and countries, in a fixed order so a rerun reads the same sites."""
+    per_tier = per_tier or {0: 0.3, 1: 0.15, 2: 0.25, 3: 0.3}
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=60)).isoformat()
+    with _client() as c:
+        r = c.get("/sources", params={"select": "*", "status": "in.(ok,partial)", "last_collected_at": f"gte.{since}",
+                                      "order": "priority.asc,id.asc", "limit": "5000"})
+        r.raise_for_status()
+        rows = r.json()
+    out = []
+    for tier, share in per_tier.items():
+        pool = sorted([s for s in rows if s.get("priority") == tier],
+                      key=lambda s: hashlib.md5(s["id"].encode()).hexdigest())
+        want, seen = max(1, round(n * share)), {}
+        for s in pool:                                  # one country at a time, round-robin, for variety
+            if len([x for x in out if x.get("priority") == tier]) >= want:
+                break
+            if seen.get(s.get("country"), 0) >= 2:
+                continue
+            seen[s.get("country")] = seen.get(s.get("country"), 0) + 1
+            out.append(s)
+    return out[:n]

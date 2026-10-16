@@ -307,3 +307,23 @@ def event_like(url: str, lastmod: str, today: dt.date) -> bool:
         except ValueError:
             pass
     return True
+
+
+_TRACKING = re.compile(r"^(utm_[a-z]+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|_ga|_gl|igshid|ref|source)$", re.I)
+_LANG_SEGMENT = re.compile(r"^/(en|fr|de|nl|it|es|pt|pl|cs|cz|hu|sv|se|da|dk|no|nb|fi|et|lv|lt|el|gr|ru|tr|ca|eu|sl|sk|"
+                           r"hr|ro|bg|sr|uk|ua|is|ga|lb|mt)(?:[-_][a-z]{2})?(?=/|$)", re.I)
+
+
+def page_key(url: str) -> str:
+    """The same page under another address: http/https, www, a trailing slash, tracking parameters, or the same path
+    in another language (/en/programme/x and /fr/programme/x). Used only to avoid reading one page twice."""
+    try:
+        p = urlparse((url or "").strip())
+    except ValueError:
+        return (url or "").strip().lower()
+    host = p.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    path = unquote(p.path or "/").rstrip("/") or "/"
+    path = _LANG_SEGMENT.sub("", path) or "/"
+    query = urlencode(sorted((k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _TRACKING.match(k)))
+    return f"{host}{path.lower()}" + (f"?{query}" if query else "")

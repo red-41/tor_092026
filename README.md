@@ -96,7 +96,15 @@ Checks inside Supabase (no cost): `company_venue_mismatches` (a company lists a 
    | `SUPABASE_SERVICE_KEY` | Supabase > Project Settings > API Keys > the **service_role** key (or a new **secret** key, `sb_secret_...`) |
    | `ANTHROPIC_API_KEY` | from console.anthropic.com > API Keys (add credit under Billing) |
 
-   Optional: a repository **variable** `MODEL` to change the Claude model (default `claude-sonnet-5`).
+   Repository **variables** (Settings > Secrets and variables > Actions > Variables), all optional:
+
+   | Name | Default | What it does |
+   |---|---|---|
+   | `AUTO_RUN` | (off) | `true` = the scheduled runs on Monday, Wednesday and Friday happen. Without it only runs started by hand happen. |
+   | `MODEL` | `claude-haiku-5-5` | reads every page |
+   | `ESCALATE_MODEL` | `claude-sonnet-5` | second look at doubtful readings (empty = none) |
+   | `MONTHLY_BUDGET_USD` | `100` | hard cap per calendar month (UTC), all runs together |
+   | `RUN_BUDGET_USD` | `25` | hard cap per run |
 
 ## Making sure it works before anything reaches the site
 
@@ -108,7 +116,52 @@ Checks inside Supabase (no cost): `company_venue_mismatches` (a company lists a 
 3. **Collect.** Run workflow > mode **collect**. The collect jobs write to the staging table; the publish job then
    publishes with the duplicate check. To only preview publishing: `select * from promote_staging_performances(dry_run => true);`
 
-After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC. Each run only reads the sources that are due.
+After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC once the variable `AUTO_RUN` is `true`.
+Each run only reads the sources that are due.
+
+## What it costs, and the caps (since 16 October 2026)
+
+- **Haiku 5.5 reads every page** (1/20 of Sonnet 5's price per token). A reading that looks doubtful gets a **second look
+  by Sonnet 5** (not 5.5: Sonnet 5.5 refuses the forced answer form the collector uses; same price): the answer was cut off, the model says it is unsure (`unsure`), or it found under half the shows of
+  the last reading of the same page (when that had 3 or more). At most 15% of a job's pages get a second look; the
+  better reading is the one kept. The duplicate check works the same way: Haiku decides, Sonnet looks again when Haiku is
+  less than 85% sure.
+- **Hard spending cap**: every request is paid from small blocks reserved in the table `collector_spend` before it is
+  sent (estimated generously, corrected to the real cost when the answer comes back). When a block would take the month
+  past `MONTHLY_BUDGET_USD` or the run past `RUN_BUDGET_USD`, nothing more is sent: what was found is kept, the rest stays
+  due, and the report says so at the top. A job that starts with the month's cap already reached sends nothing.
+  What was spent: `select * from collector_spend_by_run order by started desc;`
+- **Requests stay under 100,000 tokens** (Haiku costs 5x above that): very long pages lose their extras first, then text.
+- Set a monthly limit in the Anthropic Console too (Settings > Limits) as a second safety net. When it is reached the run
+  stops like when the credit runs out.
+
+## Production pages that would add nothing are not opened
+
+- The schedule already gives every upcoming date of the production **with a start time**, no run of it is incomplete,
+  and its **choreographer** is known (on the schedule, or from the last reading of that page): its page is skipped.
+- If only the credits are missing, **one page per production** is read and its credits, description and image go to
+  all its dates found on the schedule.
+- **The same page under another address** (another language, a trailing slash, tracking parameters) is read once.
+- A production page with **no upcoming date** is looked at again after **14 days**.
+- **Touring companies** keep the thorough reading: their production pages are always opened (they often hold tour dates
+  the calendar does not). Tiers 0 and 1 keep their calendar months, sitemap and date hunt.
+- The run report counts the skipped pages.
+
+## Season announcements
+
+When a page says when the next season, programme, festival line-up, dates or ticket sales will be published
+("La saison 2027-2028 sera dévoilée le 3 mars 2027", "Spielplan ab Mai"), the reading carries it (`announcement`). The
+source gets `announcement_at` and `announcement_note`, and its next check is **the day after the announced date** if
+that comes before the usual one. A source with nothing on yet waits for the announcement (at most 30 days for tiers 0-1,
+60 for the others). The run report lists the announcements found (### Announced).
+
+## Model test (mode compare)
+
+Actions > Collect performances > Run workflow > mode **compare**. 40 sites from all tiers (4 jobs in parallel, about an
+hour) are read by `MODEL`. For every page, the stronger model's reading of the same page text is put next to it: the
+earlier reading from the cache when the page has not changed (free), else a fresh one (at most 15 per job). Nothing is
+written to the site. Results: table `model_comparison`, compared page by page in the view `model_comparison_pages`
+(shows found by each, missed, extra, titles, choreographers). Costs about $3.
 
 ## What protects the data
 
@@ -122,7 +175,7 @@ After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC. Each 
 - **Copies inside one reading**: a date given once with its venue and once without, or twice with times exactly 1 or 2 hours apart (a UTC copy from the page's background data), is kept once: with its venue, and at the time written in the page text.
 - **Unchanged pages** are not sent to Claude again (page cache for up to 28 days), so weekly runs cost a fraction of the first.
   "Unchanged" ignores ticket noise: sold out, few tickets left, seat counts, "today/tomorrow" labels, and lines that only moved around.
-- **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old. New productions are always read.
+- **Production pages already read are not opened again** unless the next show is less than 4 weeks away or the reading is over a month old (14 days for a page with no upcoming date). New productions are always read.
 - **Batch API** (half price) for every page: first every site's schedule page in one bundle, then the further schedule
   pages (other categories, next pages, months) and the production pages in small bundles sent while browsing goes on;
   an answer that points to more pages opens them in the next bundle. **Each site is saved as soon as its own pages are
@@ -136,8 +189,11 @@ After that it runs by itself on Monday, Wednesday and Friday at 01:00 UTC. Each 
 - **Even split**: sites are dealt to the 12 jobs like cards, so every job gets the same number of sites from each tier.
 - **Safety limits**: every job finishes within 320 minutes (GitHub stops jobs at 355). A page that freezes the browser for
   5 minutes is abandoned and the browser restarted, so one bad site cannot stall a job.
-- **Credit runs out**: the run stops sending pages, saves everything found so far, and says so at the top of the report.
-  Sources not finished stay due, so the next run picks them up. A run started with no credit stops at once with a clear message.
+- **Credit runs out, the Console spend limit or our own cap is reached**: the run stops sending pages, saves everything
+  found so far, and says so at the top of the report. Sources not finished stay due, so the next run picks them up. A run
+  started with no credit stops at once with a clear message.
+- **No hanging calls**: a Claude call gives up after 7 minutes (3 retries), and every job prints a status line every
+  10 minutes (minutes, sites saved, pages with Claude, money spent).
 - **Tiers 2 and 3** read at most 15 production pages per site (tiers 0 and 1: 40).
 - **Time cap**: max 25 minutes per site, 40 production pages, 8 listing pages (14 for tiers 0-1), 10 date-hunt pages. The rest is picked up next run.
 - **PDF schedules** are read too.
@@ -165,7 +221,7 @@ After each weekly run, the `blocked` sites are then retried from your computer w
 Actions > Collect performances > Run workflow, with optional inputs:
 - `priority`: only 0 (core), 1, 2 or 3
 - `name`: only sources whose name contains this text (to retry one site)
-- `mode`: preflight (free check) or collect
+- `mode`: preflight (free check), collect, review (publish only) or compare (model test)
 - `limit`: sources per shard (12 shards run in parallel)
 - `dry`: read and report only
 
@@ -176,4 +232,5 @@ Locally: `pip install -r requirements.txt && python -m playwright install chromi
 - Sites that need a login come back as `failed`; sites that refuse bots as `blocked`. The note and screenshot say why.
 - GitHub gives private repositories 2,000 free minutes a month; a full first run of all sources can use most of that, and more is billed per minute. A public repository has unlimited minutes (your keys stay secret either way).
 - A site that changes its layout is handled automatically in most cases, because Claude reads the page rather than fixed HTML positions.
-- Claude usage grows with the number of pages read. The run summary shows tokens per run so you can track cost.
+- Claude usage grows with the number of pages read. The run summary shows tokens and dollars per run, and
+  `collector_spend_by_run` keeps the history.

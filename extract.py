@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import re
 import time
+import zlib
 
 import anthropic
 
@@ -96,7 +97,23 @@ TOOL = {
             "expected_performances": {"type": ["integer", "null"], "description": "Production page only: total number of performances the page announces (e.g. '12 performances'), if it says."},
             "next_page_url": {"type": ["string", "null"], "description": "Next page of this listing (pagination or next month), if any."},
             "schedule_url_guess": {"type": ["string", "null"], "description": "If this is not the schedule, or it shows no dance: the link most likely to be the dance/ballet programme, dance category or full calendar."},
-            "notes": {"type": ["string", "null"], "description": "Anything the editor should know (e.g. programme announced on a date)."},
+            "notes": {"type": ["string", "null"], "description": "Anything the editor should know, in one short sentence. Null if nothing."},
+            "announcement": {
+                "type": ["object", "null"],
+                "description": "Only if the page says WHEN a coming season, programme, festival line-up, more dates or "
+                               "ticket sales will be published or announced. Null otherwise.",
+                "properties": {
+                    "what": {"type": "string", "description": "What will be published, in English, e.g. '2027/28 season', 'festival programme', 'dates for Giselle'."},
+                    "date": {"type": ["string", "null"], "description": "YYYY-MM-DD when the page gives the day."},
+                    "month": {"type": ["string", "null"], "description": "YYYY-MM when the page gives only the month (or season, e.g. 'spring 2027' = the first month of it)."},
+                    "quote": {"type": "string", "description": "The sentence on the page, at most 200 characters, in its language."},
+                },
+                "required": ["what", "quote"],
+            },
+            "unsure": {"type": ["string", "null"],
+                       "description": "Only if you are not confident you read this page right (dates or times hard to tell "
+                                      "apart, unclear whether a show is dance, an unclear mixed bill or credits): why, in a "
+                                      "few words. Null when the page is clear."},
         },
         "required": ["page_status", "productions", "detail_links"],
     },
@@ -127,56 +144,105 @@ Rules:
 - dates_page_url and venue_event_url must be the venue's or company's own pages, never a third-party ticket seller.
 - On a homepage or a general page, put the site's dance/ballet programme, dance category or calendar pages in listing_links, and the best one in schedule_url_guess.
 - If the page shows no dance but the site has a dance programme, dance filter or full calendar, give it in schedule_url_guess.
+- Announcements: when the page says when the next season, programme, festival line-up, further dates or ticket sales will be published ("La saison 2027-2028 sera dévoilée le 3 mars 2027", "Spielplan 2027/28 ab Mai", "Programme announced in January"), fill announcement with the date as exact as the page gives it. Never invent a date.
+- If something on the page leaves you unsure of your reading, say so briefly in unsure; otherwise leave it null.
+- Keep notes short: one sentence, only what an editor needs.
 Always answer by calling record_page."""
 
 
 class OutOfCredit(Exception):
-    """The Anthropic account has no credit left."""
+    """The Anthropic account has no credit left, its spend limit is reached, or our own spending cap is."""
 
 
 def _credit_error(e: Exception) -> bool:
+    """Credit used up, or the spend limit set in the Anthropic Console reached: nothing more can be sent."""
     text = str(e).lower()
-    return "credit balance" in text or "billing" in text or "insufficient" in text and "credit" in text
+    return ("credit balance" in text or "billing" in text or ("insufficient" in text and "credit" in text)
+            or "usage limit" in text or "spend limit" in text or "spending limit" in text
+            or "regain access" in text)
 
 
 class Extractor:
-    def __init__(self, model: str | None = None):
-        # generous retries: new Anthropic accounts have low per-minute limits; the SDK waits as told by the API
-        self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=10, timeout=600)
+    # defaults also for instances made without __init__ (tests)
+    budget = None                   # budget.Budget: every request is paid from the spending cap first
+    escalations = 0                 # pages given a second look by ESCALATE_MODEL
+    answered = 0                    # pages answered by the first model
+    stop_note = ""                  # why nothing more is sent (credit, Console limit, our cap)
+    escalate_model = None           # the second-look model (set from config in __init__)
+    compare = False                 # run.py --compare
+    compare_fresh_left = 0
+
+    def __init__(self, model: str | None = None, budget=None):
+        # a few retries and a time limit long enough for a long answer: a stuck call must not hold a whole job
+        self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=3, timeout=420)
         self.model = model or config.MODEL
+        self.escalate_model = config.ESCALATE_MODEL
+        self.budget = budget
         self.input_tokens = 0
         self.output_tokens = 0
         self.calls = 0
         self.cache_hits = 0
-        self.out_of_credit = False      # set once the account runs dry; nothing more is sent after that
+        self.out_of_credit = False      # set once the account runs dry or a cap is reached; nothing more is sent
+
+    @property
+    def pay(self):
+        if self.budget is None:
+            import budget as _b
+            self.budget = _b.NoBudget()
+        return self.budget
+
+    capped = False                  # our own spending cap stopped the run (requests already paid are still sent)
+
+    def stop(self, why: str, capped: bool = False) -> None:
+        """Nothing more can be sent in this run."""
+        self.out_of_credit = True
+        self.capped = self.capped or capped
+        self.stop_note = self.stop_note or why
+
+    def spend(self, params: dict, batch: bool) -> float:
+        """Pay the estimated cost of a request from the spending cap; raises OutOfCredit at the cap."""
+        import budget as _b
+        if self.out_of_credit:
+            raise OutOfCredit(self.stop_note or "nothing more can be sent in this run")
+        est = _b.estimate_request(params, batch=batch)
+        try:
+            self.pay.spend(est)
+        except _b.BudgetReached as e:
+            self.stop(str(e), capped=True)
+            raise OutOfCredit(str(e)) from e
+        return est
 
     def check(self) -> None:
         """Fail fast with a clear message if the key or the model does not work."""
-        try:
-            self.client.messages.create(model=self.model, max_tokens=5,
-                                        messages=[{"role": "user", "content": "Reply with OK."}])
-        except anthropic.AuthenticationError:
-            raise SystemExit("ANTHROPIC_API_KEY was refused. Check the GitHub secret (Settings > Secrets > Actions).")
-        except anthropic.PermissionDeniedError as e:
-            raise SystemExit(f"Anthropic refused the request (credit or permissions?): {e}")
-        except anthropic.NotFoundError:
-            raise SystemExit(f"Model '{self.model}' is not available to this key. Set the MODEL variable to one that is.")
-        except anthropic.APIStatusError as e:
-            if _credit_error(e):
-                raise SystemExit("The Anthropic credit is used up. Add credit in the Console (Settings > Billing) and run again.")
-            raise
+        for model in [self.model] + ([self.escalate_model] if getattr(self, "escalate_model", None) else []):
+            try:
+                self.client.messages.create(model=model, max_tokens=5,
+                                            messages=[{"role": "user", "content": "Reply with OK."}])
+            except anthropic.AuthenticationError:
+                raise SystemExit("ANTHROPIC_API_KEY was refused. Check the GitHub secret (Settings > Secrets > Actions).")
+            except anthropic.PermissionDeniedError as e:
+                raise SystemExit(f"Anthropic refused the request (credit or permissions?): {e}")
+            except anthropic.NotFoundError:
+                raise SystemExit(f"Model '{model}' is not available to this key. Set the MODEL / ESCALATE_MODEL "
+                                 "variables to models that are.")
+            except anthropic.APIStatusError as e:
+                if _credit_error(e):
+                    raise SystemExit("The Anthropic credit is used up or the Console spend limit is reached. "
+                                     "Add credit or raise the limit in the Console, then run again.")
+                raise
 
-    def request_params(self, snap, source: dict, venues: list[dict], role: str) -> dict:
-        """The Claude request for one page (used live or inside a batch)."""
+    def _user_text(self, snap, source: dict, venues: list[dict], role: str, lim: dict) -> str:
         today = dt.date.today().isoformat()
-        venue_names = sorted({v["name"] for v in venues if v.get("name")})[:300]
+        venue_names = sorted({v["name"] for v in venues if v.get("name")})[:lim["venues"]]
         site = snap.final_url.split("/")[2] if "//" in snap.final_url else ""
-        same_site = [(t, h) for t, h in snap.links if site and site.split(".")[-2] in h][:300]
+        same_site = [(t, h) for t, h in snap.links if site and site.split(".")[-2] in h][:lim["same"]]
         mine = set(same_site)
         other_sites = [(t, h) for t, h in snap.links if (t, h) not in mine and not lenses.is_ticket_seller(h)
-                       and not SOCIAL.search(h)][:80]
-        events = json.dumps(snap.events, ensure_ascii=False)[:20000] if snap.events else ""
-        user = (
+                       and not SOCIAL.search(h)][:lim["other"]]
+        events = json.dumps(snap.events, ensure_ascii=False)[:lim["events"]] if snap.events else ""
+        feeds = (getattr(snap, "feeds", None) or []) if lim["feeds"] else []
+        sitemap = (getattr(snap, "sitemap", None) or [])[:lim["sitemap"]]
+        return (
             f"Today: {today}\n"
             f"Source: {source.get('name')} ({source.get('kind')}, tier {source.get('priority')}), {source.get('city')}, {source.get('country')}. "
             f"Time zone {source.get('timezone')}.\n"
@@ -185,22 +251,35 @@ class Extractor:
             f"Known venues in this country (reuse exact names): {'; '.join(venue_names) or 'none'}\n\n"
             + (f"Structured event data found in the page (schema.org and calendar files):\n{events}\n\n" if events else "")
             + ("Data this page loaded in the background (may hold the individual dates):\n"
-               + "\n".join(f"{f['url']}\n{f['text']}" for f in (getattr(snap, 'feeds', None) or [])) + "\n\n"
-               if getattr(snap, "feeds", None) else "")
+               + "\n".join(f"{f['url']}\n{f['text']}" for f in feeds) + "\n\n" if feeds else "")
             + ("Event and production pages listed in this site's sitemap (addresses only). Put the dance productions "
                "among them whose dates are not on this page into detail_links:\n"
-               + "\n".join(getattr(snap, "sitemap", None) or []) + "\n\n" if getattr(snap, "sitemap", None) else "")
+               + "\n".join(sitemap) + "\n\n" if sitemap else "")
             + "Links on the page (text | url):\n" + "\n".join(f"{t} | {h}" for t, h in same_site) + "\n\n"
             + ("Links to other sites, e.g. host venues of a tour (text | url):\n"
                + "\n".join(f"{t} | {h}" for t, h in other_sites) + "\n\n" if other_sites else "")
-            + "Page text:\n" + snap.text[: config.PAGE_TEXT_LIMIT]
+            + "Page text:\n" + snap.text[: lim["text"]]
         )
-        return dict(
-            model=self.model, max_tokens=32000, tools=[TOOL],
+
+    def request_params(self, snap, source: dict, venues: list[dict], role: str, model: str | None = None) -> dict:
+        """The Claude request for one page (used live or inside a batch). Kept under MAX_PROMPT_TOKENS: Haiku costs
+        five times as much above 100,000 tokens, so very long pages lose their extras first, then text."""
+        import budget as _b
+        lim = {"venues": 300, "same": 300, "other": 80, "events": 20000, "feeds": True, "sitemap": config.SITEMAP_LIMIT,
+               "text": config.PAGE_TEXT_LIMIT}
+        fixed = _b.estimate_tokens(SYSTEM) + _b.estimate_tokens(json.dumps(TOOL))
+        user = self._user_text(snap, source, venues, role, lim)
+        for shrink in ({"sitemap": 60, "other": 20, "venues": 150}, {"feeds": False, "events": 8000, "same": 120},
+                       {"text": 30000}, {"text": 15000, "same": 60, "events": 3000}):
+            if fixed + _b.estimate_tokens(user) <= config.MAX_PROMPT_TOKENS:
+                break
+            lim.update(shrink)
+            user = self._user_text(snap, source, venues, role, lim)
+        return retarget(dict(
+            model=model or self.model, max_tokens=32000, tools=[TOOL],
             system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            tool_choice={"type": "tool", "name": "record_page"},
             messages=[{"role": "user", "content": user}],
-        )
+        ), model or self.model)
 
     @staticmethod
     def parse(resp) -> dict:
@@ -218,20 +297,49 @@ class Extractor:
         return {"page_status": "not_a_schedule", "productions": [], "detail_links": [], "_truncated": True,
                 "notes": "no answer (page too long)" if truncated else "no answer"}
 
-    def read(self, snap, source: dict, venues: list[dict], role: str) -> dict:
-        if self.out_of_credit:
-            raise OutOfCredit("credit already used up in this run")
+    def read(self, snap, source: dict, venues: list[dict], role: str, model: str | None = None) -> dict:
+        """One page answered straight away (full price), paid from the spending cap."""
+        import budget as _b
+        params = self.request_params(snap, source, venues, role, model)
+        est = self.spend(params, batch=False)
         try:
-            resp = self.client.messages.create(**self.request_params(snap, source, venues, role))
+            resp = self.client.messages.create(**params)
         except anthropic.APIStatusError as e:
+            self.pay.answered(est, 0.0)                  # a refused request is not billed
             if _credit_error(e):
-                self.out_of_credit = True
+                self.stop(f"Anthropic: {str(e)[:200]}")
                 raise OutOfCredit(str(e)) from e
+            raise
+        except Exception:
+            self.pay.answered(est, 0.0)
             raise
         self.calls += 1
         self.input_tokens += resp.usage.input_tokens
         self.output_tokens += resp.usage.output_tokens
-        return self.parse(resp)
+        self.pay.answered(est, _b.usage_cost(params["model"], resp.usage))
+        data = self.parse(resp)
+        data["_model"] = params["model"]
+        data["_usage"] = _usage_dict(resp.usage)
+        return data
+
+
+def tool_choice(model: str, name: str = "record_page") -> dict:
+    """Force the answer form, except for models that refuse a forced tool call (the prompt asks for it anyway)."""
+    return {"type": "auto"} if model in config.NO_FORCED_TOOL else {"type": "tool", "name": name}
+
+
+def retarget(params: dict, model: str) -> dict:
+    """The same request for another model (the second look)."""
+    params["model"] = model
+    name = ((params.get("tool_choice") or {}).get("name")
+            or ((params.get("tools") or [{}])[0] or {}).get("name") or "record_page")
+    params["tool_choice"] = tool_choice(model, name)
+    return params
+
+
+def _usage_dict(usage) -> dict:
+    return {k: getattr(usage, k, None) or 0 for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                                                      "cache_read_input_tokens")}
 
 
 class Batch:
@@ -255,13 +363,37 @@ class Batch:
         self.calls = 0
         self.submitted = 0
         self.out_of_credit = False
+        self.meta: dict[str, tuple[str, float]] = {}     # key -> (model, estimated cost already paid from the cap)
+        self._packed: dict[str, bytes] = {}             # key -> the request, compressed (kept for a second look)
+        self.second: dict[str, str] = {}                # key of a second-look request -> why it was asked
 
     def add(self, params: dict, context) -> str:
+        """Queue one page. Its estimated cost is paid from the spending cap now (raises OutOfCredit at the cap)."""
+        est = self.ex.spend(params, batch=True)
         key = f"p{len(self.requests):06d}"
         self.requests.append(key)
         self._unsent.append({"custom_id": key, "params": params})
         self.context[key] = context
+        self.meta[key] = (params.get("model") or self.ex.model, est)
+        if getattr(self.ex, "escalate_model", None):
+            self._packed[key] = zlib.compress(json.dumps(params, ensure_ascii=False).encode(), 6)
         return key
+
+    def take_params(self, key: str) -> dict | None:
+        """The request of an answered page (for a second look by a stronger model)."""
+        packed = getattr(self, "_packed", {}).pop(key, None)
+        return json.loads(zlib.decompress(packed)) if packed else None
+
+    def forget(self, key: str) -> None:
+        getattr(self, "_packed", {}).pop(key, None)
+
+    def _refund(self, keys) -> None:
+        """Pages that were never sent (or not answered): not billed, so their estimate goes back."""
+        meta = getattr(self, "meta", {})
+        for k in keys:
+            model, est = meta.pop(k, (None, 0.0))
+            if est:
+                self.ex.pay.answered(est, 0.0)
 
     @property
     def unsent(self) -> int:
@@ -274,9 +406,12 @@ class Batch:
     def submit(self) -> None:
         """Send every page added since the last call."""
         while self._unsent:
-            if self.ex.out_of_credit:
+            if self.ex.out_of_credit and not getattr(self.ex, "capped", False):
+                # Anthropic refuses requests: these would fail. (At our own cap, pages already paid are still sent.)
                 self.out_of_credit = True
-                self._failed += [r["custom_id"] for r in self._unsent]
+                keys = [r["custom_id"] for r in self._unsent]
+                self._failed += keys
+                self._refund(keys)
                 self._unsent = []
                 return
             chunk = self._unsent[: self.CHUNK]
@@ -284,8 +419,10 @@ class Batch:
                 bid = self.ex.client.messages.batches.create(requests=chunk).id
             except anthropic.APIStatusError as e:
                 if _credit_error(e):
-                    self.out_of_credit = self.ex.out_of_credit = True
-                    print("batch: the Anthropic credit is used up; these pages wait for the next run", flush=True)
+                    self.out_of_credit = True
+                    self.ex.stop(f"Anthropic: {str(e)[:200]}")
+                    print("batch: the Anthropic credit is used up or the Console spend limit reached; "
+                          "these pages wait for the next run", flush=True)
                     continue
                 raise
             self._open[bid] = [r["custom_id"] for r in chunk]
@@ -311,21 +448,33 @@ class Batch:
         return done
 
     def _collect(self, bid: str) -> list[tuple[str, dict | None]]:
+        import budget as _b
         keys = self._open.pop(bid)
         got = {}
+        complete = False
         try:
             for entry in self.ex.client.messages.batches.results(bid):
+                model, est = self.meta.pop(entry.custom_id, (self.ex.model, 0.0))
                 if entry.result.type == "errored" and _credit_error(Exception(str(getattr(entry.result, "error", "")))):
-                    self.out_of_credit = self.ex.out_of_credit = True
+                    self.out_of_credit = True
+                    self.ex.stop("Anthropic: the credit ran out or the Console spend limit was reached")
                 if entry.result.type != "succeeded":
+                    self.ex.pay.answered(est, 0.0)          # errored, cancelled or expired requests are not billed
                     continue
                 msg = entry.result.message
                 self.calls += 1
                 self.input_tokens += msg.usage.input_tokens
                 self.output_tokens += msg.usage.output_tokens
-                got[entry.custom_id] = self.ex.parse(msg)
+                self.ex.pay.answered(est, _b.usage_cost(model, msg.usage, batch=True))
+                data = self.ex.parse(msg)
+                data["_model"] = model
+                data["_usage"] = _usage_dict(msg.usage)
+                got[entry.custom_id] = data
+            complete = True
         except Exception as e:
             print(f"batch {bid}: could not fetch all answers ({type(e).__name__}: {str(e)[:120]})", flush=True)
+        if complete:          # pages missing from a complete result list were never processed: not billed
+            self._refund([k for k in keys if k not in got and k in self.meta])
         print(f"batch {bid}: {len(got)} of {len(keys)} pages answered"
               + (" (the Anthropic credit ran out)" if self.out_of_credit else ""), flush=True)
         return [(k, got.get(k)) for k in keys]
@@ -347,6 +496,7 @@ class Batch:
     def drop_unsent(self) -> list[str]:
         """Pages added but never sent (the run ended first): not billed; they are simply read next run."""
         keys = [r["custom_id"] for r in self._unsent] + self._failed
+        self._refund([r["custom_id"] for r in self._unsent])
         self._unsent, self._failed = [], []
         return keys
 

@@ -5,8 +5,37 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Model used to read pages. Override with the MODEL secret or variable.
-MODEL = os.environ.get("MODEL", "claude-sonnet-5")
+# Model used to read pages. Override with the MODEL repository variable.
+MODEL = os.environ.get("MODEL") or "claude-haiku-5-5"
+# Second look: a page whose first reading looks doubtful (answer cut off, the model says it is unsure, or far fewer
+# shows than last time) is read again by this model. Empty = no second look. Sonnet 5, not 5.5: Sonnet 5.5 refuses the
+# forced answer form (tool_choice "tool") the collector uses; the price is the same.
+ESCALATE_MODEL = os.environ.get("ESCALATE_MODEL", "claude-sonnet-5")
+# Models that refuse a forced tool call (they answer with tool_choice "auto"; the prompt still says to call the tool).
+# Source: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use (checked 16 Oct 2026)
+NO_FORCED_TOOL = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"}
+ESCALATE_MAX_SHARE = float(os.environ.get("ESCALATE_MAX_SHARE", "0.15"))   # at most this share of a run's pages
+ESCALATE_DROP = 0.5             # "far fewer": under half the shows of the last reading of the same page...
+ESCALATE_DROP_MIN = 3           # ...when that reading had at least this many
+# Readings by these models are reused for an unchanged page (a stronger model's reading is at least as good).
+CACHE_MODELS = {MODEL, ESCALATE_MODEL, "claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5"} - {""}
+
+# Spending cap (USD), shared by all jobs of a run and the duplicate check. The month is the UTC calendar month.
+MONTHLY_BUDGET_USD = float(os.environ.get("MONTHLY_BUDGET_USD") or 100)
+RUN_BUDGET_USD = float(os.environ.get("RUN_BUDGET_USD") or 25)
+BUDGET_BLOCK_USD = 0.25         # reserved from the ledger at a time
+EST_OUTPUT_TOKENS = 1500        # answer length assumed before an answer comes back (corrected afterwards)
+# USD per million tokens: (input, output, cache write 5m, cache read). Batch API: half of these.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 16 Oct 2026)
+PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50, 0.125, 0.01),
+    "claude-sonnet-5-5": (2.0, 10.0, 2.50, 0.10),
+    "claude-sonnet-5": (2.0, 10.0, 2.50, 0.20),
+    "claude-opus-5-5": (4.0, 20.0, 5.0, 0.20),
+}
+LONG_PROMPT_TOKENS = 100_000    # Haiku 5.5 costs 5x for prompts above this...
+LONG_PROMPT_FACTOR = {"claude-haiku-5-5": 5.0}
+MAX_PROMPT_TOKENS = 85_000      # ...so a page's request is trimmed to stay under it (estimated generously)
 
 # Pages are opened as a normal, current Chrome (empty = match the installed browser version).
 USER_AGENT = os.environ.get("USER_AGENT", "")
@@ -19,6 +48,12 @@ MAX_DETAIL_PAGES = int(os.environ.get("MAX_DETAIL_PAGES", "40"))    # production
 DETAIL_CAP = {0: MAX_DETAIL_PAGES, 1: MAX_DETAIL_PAGES, 2: 15, 3: 15}  # tiers 2-3: most dates are on the listing
 DETAIL_REFRESH_DAYS = 30        # a production page already read is re-read at most monthly...
 DETAIL_SOON_DAYS = 28           # ...or weekly-ish once its next show is less than 4 weeks away (cancellations, times)
+DETAIL_NODATE_DAYS = 14         # a production page showing no upcoming date is looked at again after two weeks
+ANNOUNCE_MAX_WAIT_DAYS = 60     # a site with nothing on yet waits for its announced date, but never longer than this
+# --compare: reference readings (an unchanged page's earlier reading by these models is reused for free)
+COMPARE_REF_MODELS = {"claude-sonnet-5", "claude-sonnet-5-5"}
+COMPARE_FRESH_MAX = int(os.environ.get("COMPARE_FRESH_MAX", "60"))   # fresh reference readings allowed per test
+COMPARE_DETAIL_CAP = 6          # production pages per source in the test
 USE_BATCH = os.environ.get("USE_BATCH", "1") != "0"   # production pages go through the half-price Batch API
 JOB_MINUTES = float(os.environ.get("JOB_MINUTES", "320"))  # everything stops by then: well inside GitHub's 355-minute job limit
 LISTING_BATCH_MINUTES = 120     # round 1: wait for the schedule-page batch until this many minutes into the job
