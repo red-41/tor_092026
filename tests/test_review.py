@@ -118,7 +118,9 @@ def test_main_flow_applies_only_confident_verdicts(monkeypatch, tmp_path):
     answers = {"pair": {"verdict": "same", "keep": "A", "confidence": 0.97, "reason": "same show"},
                "conflict": {"verdict": "ignore_listings", "ignore_listing_ids": [12], "confidence": 0.5, "reason": "?"}}
     monkeypatch.setattr(db, "rpc", fake_rpc)
-    monkeypatch.setattr(review, "ask", lambda client, model, case, pages: answers[case["kind"]])
+    asked = []
+    monkeypatch.setattr(review, "ask", lambda client, model, case, pages, pay=None:
+                        asked.append((model, case["kind"])) or dict(answers[case["kind"]]))
     monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages"])
@@ -130,6 +132,9 @@ def test_main_flow_applies_only_confident_verdicts(monkeypatch, tmp_path):
     assert applied[0]["p_verdict"] == "same" and applied[0]["p_keep"] == "A"
     assert applied[1]["p_verdict"] == "unsure"            # 0.5 confidence: left for a person
     assert (tmp_path / "reports").exists()
+    # the confident verdict is the first model's; the unsure one got a second look by the stronger model
+    assert asked == [(config.MODEL, "pair"), (config.MODEL, "conflict"), (config.ESCALATE_MODEL, "conflict")]
+    assert "[second look]" in applied[1]["p_note"]
 
 
 def test_timezone_follows_the_country_of_the_date():

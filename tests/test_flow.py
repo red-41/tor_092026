@@ -149,8 +149,11 @@ def test_production_page_reread_rule():
     assert run.reusable(prev(["2026-12-01"]), today)                 # far away and read recently: skip
     assert not run.reusable(prev(["2026-10-05"]), today)             # next show within 4 weeks: read again
     assert not run.reusable(prev(["2026-12-01"], old), today)        # read over a month ago: read again
-    assert not run.reusable(prev([]), today)                         # no dates known yet: read again
-    assert run.reusable(prev(["2026-01-01"]), today)                 # run is over: skip
+    two_weeks = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=15)).isoformat()
+    assert run.reusable(prev([]), today)                             # no dates yet, read this week: wait
+    assert not run.reusable(prev([], two_weeks), today)              # no dates yet, read over 2 weeks ago: read again
+    assert run.reusable(prev(["2026-01-01"]), today)                 # run is over, read recently: skip
+    assert not run.reusable(prev(["2026-01-01"], two_weeks), today)  # ...and again after 2 weeks
     assert not run.reusable(None, today)
 
 
