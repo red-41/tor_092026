@@ -2,13 +2,15 @@ name: Collect performances
 
 on:
   schedule:
-    - cron: "0 1 * * 1,3,5"    # Monday, Wednesday, Friday 01:00 UTC; each source is only read when it is due
+    # Monday, Wednesday, Friday 01:00 UTC; each source is only read when it is due.
+    # Scheduled runs only happen when the repository variable AUTO_RUN is "true" (Settings > Variables > Actions).
+    - cron: "0 1 * * 1,3,5"
   workflow_dispatch:
     inputs:
       mode:
-        description: "preflight = free check that every site opens (no Claude). collect = read schedules, then publish with the duplicate check. review = only publish and check what is waiting."
+        description: "preflight = free check that every site opens (no Claude). collect = read schedules, then publish with the duplicate check. review = only publish and check what is waiting. compare = model test on 40 sites (writes nothing to the site)."
         type: choice
-        options: [preflight, collect, review]
+        options: [preflight, collect, review, compare]
         default: preflight
       priority:
         description: "collect: only this tier (0 = core, 1, 2 or 3); empty = all"
@@ -32,7 +34,12 @@ env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  MODEL: ${{ vars.MODEL || 'claude-sonnet-5' }}
+  # Haiku reads every page; doubtful readings get a second look by ESCALATE_MODEL (empty = none).
+  MODEL: ${{ vars.MODEL || 'claude-haiku-5-5' }}
+  ESCALATE_MODEL: ${{ vars.ESCALATE_MODEL || 'claude-sonnet-5' }}
+  # Spending cap in USD, shared by all jobs of a run: per calendar month and per run.
+  MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '100' }}
+  RUN_BUDGET_USD: ${{ vars.RUN_BUDGET_USD || '25' }}
   MODE: ${{ github.event.inputs.mode || 'collect' }}
   NAME: ${{ github.event.inputs.name }}
   PRIORITY: ${{ github.event.inputs.priority }}
@@ -41,7 +48,7 @@ env:
 
 jobs:
   run:
-    if: github.event.inputs.mode != 'review'
+    if: (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'review' && github.event.inputs.mode != 'compare'
     runs-on: ubuntu-latest
     timeout-minutes: 355
     strategy:
@@ -76,7 +83,7 @@ jobs:
   # uncertain ones and possible duplicate pairs go to Claude, confident answers are applied, the rest wait.
   publish:
     needs: run
-    if: always() && github.event.inputs.mode != 'preflight' && github.event.inputs.dry != 'true'
+    if: always() && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'preflight' && github.event.inputs.mode != 'compare' && github.event.inputs.dry != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -96,7 +103,7 @@ jobs:
 
   summary:
     needs: run
-    if: always()
+    if: always() && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'compare'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +127,7 @@ jobs:
   # Needs a self-hosted runner (see README) and the repository variable HOME_RUNNER = true.
   from-home:
     needs: run
-    if: always() && vars.HOME_RUNNER == 'true' && github.event.inputs.mode != 'preflight'
+    if: always() && vars.HOME_RUNNER == 'true' && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'preflight' && github.event.inputs.mode != 'compare'
     runs-on: self-hosted
     timeout-minutes: 600
     steps:
@@ -135,5 +142,34 @@ jobs:
         if: always()
         with:
           name: report-from-home
+          path: reports/
+          if-no-files-found: ignore
+
+  # Model test: 40 sites from all tiers read by MODEL; the stronger model's reading of the same pages is put next to
+  # each page (reused from last time when the page has not changed, else read fresh, at most 15 pages per job).
+  # Writes nothing to the site; the results are in the table model_comparison. Costs about $3.
+  compare:
+    if: github.event.inputs.mode == 'compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      COMPARE_FRESH_MAX: "15"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python run.py --compare 40 --shard ${{ matrix.shard }} --shards 4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compare-shard-${{ matrix.shard }}
           path: reports/
           if-no-files-found: ignore
