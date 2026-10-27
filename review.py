@@ -60,9 +60,15 @@ Different performances: different works (pieces of one mixed bill are separate r
 each other), different companies, different start times at one venue (matinee and evening), different stages
 with different shows, a talk or workshop next to the show.
 
-Which row to keep for a duplicate: the one listed by the host venue's own website (rank 1), otherwise by a
-festival (rank 2), otherwise by the company (rank 3); if equal, the one with a start time and the more
-complete credits.
+One website listing the same piece twice on one day with two different times: two sessions (school shows at
+09:00 and 10:30, a matinee and an evening) unless its page shows only one of the times, then the other is stale.
+A touch tour or pre-show talk an hour or so before a show is not a separate performance.
+
+Which row to keep for a duplicate: the richer one, the row with more data (more websites listing it, a real start
+time, fuller credits, an English title with the original); if equal, the one listed by the host venue's own
+website (rank 1), then a festival (rank 2), then the company (rank 3). When both rows come from the same website
+and their times differ, keep the row with the right time. Put its id (the "id" field of a or b, or of the
+candidate) in keep.
 
 For a conflict: name the listing(s) that are wrong (ignore_listings), for example a company site's building
 name or a stale time when the host venue's own page says otherwise, or a listing attached to the wrong
@@ -220,6 +226,34 @@ def decide(client, case: dict, pages: dict[str, str], pay=None) -> dict:
     return v
 
 
+def richness(p: dict) -> tuple:
+    """How much a row carries: websites listing it, a real start time, details filled, then the best site's rank."""
+    sites = p.get("listed_by") or []
+    filled = sum(1 for k in ("venue", "company", "choreographer", "program", "original_title", "ticket_url") if p.get(k))
+    timed = 0 if p.get("time_tbc") or not p.get("time") or str(p.get("time")).startswith("00:00") else 1
+    best = min([s.get("rank") or 9 for s in sites] or [9])
+    return (len(sites), timed, filled, -best)
+
+
+def keep_id(case: dict, keep) -> str | None:
+    """The row a 'same' verdict keeps. The model sometimes answers "a", "row b" or a shortened id instead of the full
+    id: those are read. Without a usable answer a pair keeps its richer row and a held listing its only candidate
+    (several candidates: None, a person decides)."""
+    k = str(keep or "").strip().lower()
+    if case["kind"] == "held":
+        ids = [c["id"] for c in case.get("candidates") or []]
+        hit = [i for i in ids if k and (i.lower() == k or (len(k) >= 6 and i.lower().startswith(k)))]
+        if len(hit) == 1:
+            return hit[0]
+        return ids[0] if len(ids) == 1 else None
+    a, b = case.get("a") or {}, case.get("b") or {}
+    for label, p in (("a", a), ("b", b)):
+        pid = str(p.get("id") or "").lower()
+        if k in (label, "row " + label, "row_" + label) or (pid and (k == pid or (len(k) >= 6 and pid.startswith(k)))):
+            return p.get("id")
+    return a.get("id") if richness(a) >= richness(b) else b.get("id")
+
+
 def to_call(case: dict, v: dict) -> dict:
     """The apply_review arguments for a verdict, with checks: anything malformed or not confident is 'unsure'."""
     kind, verdict = case["kind"], v.get("verdict")
@@ -230,12 +264,11 @@ def to_call(case: dict, v: dict) -> dict:
     if verdict not in allowed or conf < MIN_CONFIDENCE:
         return call
     if verdict == "same":
-        ids = ([c["id"] for c in case.get("candidates") or []] if kind == "held"
-               else [(case.get("a") or {}).get("id"), (case.get("b") or {}).get("id")])
-        if v.get("keep") not in ids:
+        keep = keep_id(case, v.get("keep"))
+        if not keep:
             call["p_note"] = note + " [no valid row to keep given]"
             return call
-        call["p_keep"] = v["keep"]
+        call["p_keep"] = keep
     if verdict == "ignore_listings":
         valid = {r.get("listing_id") for r in (case.get("performance") or {}).get("listed_by") or []}
         ids = [i for i in v.get("ignore_listing_ids") or [] if i in valid]
