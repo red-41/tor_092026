@@ -114,27 +114,31 @@ TOOL = {
                        "description": "Only if you are not confident you read this page right (dates or times hard to tell "
                                       "apart, unclear whether a show is dance, an unclear mixed bill or credits): why, in a "
                                       "few words. Null when the page is clear."},
+            "complete": {"type": "boolean",
+                         "description": "true when productions holds every dated dance performance this page shows; false "
+                                        "if you left any out (however few)."},
         },
-        "required": ["page_status", "productions", "detail_links"],
+        "required": ["page_status", "productions", "detail_links", "complete"],
     },
 }
 
 SYSTEM = """You extract upcoming dance and ballet performances from theatre and festival websites for Saffitt, a dance calendar.
 Rules:
-- Only staged dance and ballet performances open to the public. Leave out workshops, classes, open rehearsals, talks, guided tours, cinema screenings, exhibitions, amateur or school showcases, and opera/concerts without dance.
+- Only staged dance and ballet performances open to the public. Leave out workshops, classes, participatory sessions (also for children), open rehearsals, talks, guided tours, cinema screenings, exhibitions, amateur or school showcases, musicals and family musicals, and opera/concerts without dance.
 - Children's and family dance and ballet are wanted when the public can buy tickets, also on weekday mornings; tag them Family. Leave out only performances reserved for school groups ("school performance", "séance scolaire", "Schulvorstellung", "voorstelling voor scholen", booked by schools only), and children's plays, musicals, VR or digital experiences that are not dance (a children's piece stays only if it is ballet or dance).
 - Leave out folk, traditional and ethnic dance: folk ensembles, national folk dance companies, and shows built on folk dance (Hungarian, Transylvanian, Carpathian, Balkan, Irish, Indian classical, flamenco, tango shows and similar), also when a dance theatre presents them. This means flamenco performances themselves (flamenco shows, tablao, flamenco recitals). Established Spanish dance companies (for example Ballet Nacional de España, Ballet Español de la Comunidad de Madrid) stay: their work counts as flamenco-inspired ballet. When a show is on the line between flamenco and flamenco-inspired ballet or contemporary dance, keep it. Flamenco-inspired ballets and contemporary choreographies always stay in, and so does every work by Marcos Morau / La Veronal (for example Afanador), whatever company dances it. Shows by flamenco artists (for example Rocío Molina, Israel Galván) are left out, except when this site is a tier 0 or tier 1 venue or festival and it presents the show as contemporary dance, not as flamenco.
 - Only performances on or after today's date.
+- You answer with exactly one record_page call; there is no second call. Record every dated dance performance on the page, however long the list: never stop after the first productions and never leave the rest for later. Set complete to false if anything is left out.
 - Give every date and time of a production in its performances list. A run of 12 dates has 12 entries.
 - List only the date and time pairs the page actually shows. Never pair every date of a run with every time mentioned: if the page lists times per day (matinees only on some days, a day without shows), follow it day by day.
 - Mixed bill (several pieces in one evening): one production entry per piece, each with the evening's dates, plus program and program_position.
-- Titles in English (use the site's English version if there is one), with original_title for the native title when different.
+- title is always in English: use the site's English version if there is one, else translate the title unless it is a proper name ("Nelken" -> "Carnations", "Drøm" -> "Dream"). Put the title as the page writes it in original_title.
 - Genre tags: always at least one of Classical, Neoclassical, Contemporary.
 - If the time is not published, set time to null. Never guess a time.
 - description: your own words, 1 to 2 sentences, never copied.
 - Use absolute URLs. Prefer the booking link for that exact date as ticket_url, else the production page.
 - If dates or times are only on production pages, list those pages in detail_links (dance productions only).
-- Never turn a date range into individual dates. List only dates that are written on the page or in its data. If a venue's run shows only a range, or fewer dates than announced, describe it in the production's runs (start, end, how many performances are announced, where the individual dates may be). Exception: if the page states a weekly pattern ("Thu and Fri 20:30, Sat 16:30 and 20:30"), work out the dates from it and mark them date_basis "pattern".
+- Never turn a date range into individual dates: "9-14 February" or "du 21 au 23 octobre" is a run (start, end), not one performance per day. List only dates that are written on the page or in its data. If a venue's run shows only a range, or fewer dates than announced, describe it in the production's runs (start, end, how many performances are announced, where the individual dates may be). Exception: if the page states a weekly pattern ("Thu and Fri 20:30, Sat 16:30 and 20:30"), work out the dates from it and mark them date_basis "pattern".
 - Touring: every date belongs to the venue, city and country shown with that date, also in small print ("on tour", "Gastspiel", "en tournée", "gira", a city name or a flag). On a venue's own schedule, a date marked with another venue or city happens there, not at the house. Never fill in the house or the company's home city for a date that names another place; leave venue null when no place is given.
 - Give each performance the IANA time zone of its venue's location.
 - Times are local wall-clock times at the venue. Background data often stores times in UTC or with an offset ("2026-10-01T17:30:00Z", "+02:00"): convert them to the venue's local time. When the page text shows a time, that time wins.
@@ -228,7 +232,8 @@ class Extractor:
             except anthropic.APIStatusError as e:
                 if _credit_error(e):
                     raise SystemExit("The Anthropic credit is used up or the Console spend limit is reached. "
-                                     "Add credit or raise the limit in the Console, then run again.")
+                                     "Add credit or raise the limit in the Console, then run again.\n"
+                                     f"Anthropic said ({model}): {str(e)[:400]}")
                 raise
 
     def _user_text(self, snap, source: dict, venues: list[dict], role: str, lim: dict) -> str:
