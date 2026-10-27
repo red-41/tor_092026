@@ -130,7 +130,7 @@ def test_a_job_starting_at_the_cap_sends_nothing(world, tmp_path):
 # ---------- Haiku first, Sonnet for a second look ----------
 
 class TwoModels(Claude):
-    """The small model is unsure about unsure.org and drops shows on drop.org; the big model reads both right."""
+    """The small model leaves shows out on unsure.org (and says so); the big model reads it right."""
     def __init__(self):
         super().__init__()
         self.models = []
@@ -141,7 +141,7 @@ class TwoModels(Claude):
         text = params["messages"][0]["content"]
         if params["model"] == "small" and "URL: https://unsure.org/" in text:
             resp.content[0].input = {"page_status": "has_performances", "productions": [], "detail_links": [],
-                                     "unsure": "dates and times hard to tell apart"}
+                                     "complete": False, "unsure": "the rest of the list is on the page"}
         return resp
 
 
@@ -187,7 +187,16 @@ def test_second_look_reasons_and_its_limit(monkeypatch):
     ex = SimpleNamespace(model="small", escalate_model="big", escalations=0, answered=0)
     monkeypatch.setattr(db, "cache_peek", lambda key, role: None)
     assert run.second_look(ex, {"_truncated": True, "productions": []}, "u", "r") == "answer cut off"
-    assert run.second_look(ex, {"unsure": "unclear bill", "productions": []}, "u", "r").startswith("unsure")
+    assert run.second_look(ex, {"complete": False, "productions": []}, "u", "r") == "the reading says it left shows out"
+    assert run.second_look(ex, {"unsure": "I recorded only the first production", "productions": []},
+                           "u", "r").startswith("unsure")
+    assert run.second_look(ex, {"unsure": "times are not published", "productions": []}, "u", "r") is None
+    d = dt.date.today() + dt.timedelta(days=30)
+    days = [{"date": (d + dt.timedelta(days=i)).isoformat()} for i in range(6)]
+    assert run.second_look(ex, {"productions": [{"title": "Drøm", "performances": days}]}, "u", "r").startswith(
+        "dates of a range written out")
+    timed = [{**x, "time": "19:30"} for x in days]
+    assert run.second_look(ex, {"productions": [{"title": "Drøm", "performances": timed}]}, "u", "r") is None
     assert run.second_look(ex, {"productions": [], "_model": "big"}, "u", "r") is None     # already the big model
     prev = {"result": {"productions": [{"title": "X", "performances": [{"date": FUTURE}] * 6}]}}
     monkeypatch.setattr(db, "cache_peek", lambda key, role: prev)
@@ -344,6 +353,7 @@ def test_comparison_records_both_readings(monkeypatch):
 
     class Ex:
         model, escalate_model, compare, compare_fresh_left = "small", "big", True, 1
+        answered = escalations = 0
         pay = budget.NoBudget()
 
         def read(self, snap, source, venues, role, model=None):
@@ -352,6 +362,7 @@ def test_comparison_records_both_readings(monkeypatch):
     ex = Ex()
     run.read_page(ex, snap, src("X", "https://x.org/"), [], run.LISTING, True)
     assert rows[0]["ref_from_cache"] is True and rows[0]["ref_model"] == "claude-sonnet-5" and answers == ["small"]
+    assert "second_look" in rows[0] and rows[0]["final_result"] == rows[0]["result"]    # no second look needed
     peek["text_hash"] = "changed"
     run.read_page(ex, snap, src("X", "https://x.org/"), [], run.LISTING, True)
     assert rows[1]["ref_from_cache"] is False and rows[1]["ref_model"] == "big" and answers == ["small", "small", "big"]
@@ -374,13 +385,73 @@ def test_compare_mode_reads_live_and_writes_nothing_to_the_site(world, tmp_path)
 
 def test_answer_form_is_forced_only_where_the_model_accepts_it():
     from extract import retarget, tool_choice
-    assert tool_choice("claude-haiku-5-5") == {"type": "tool", "name": "record_page"}
+    assert tool_choice("claude-haiku-5-5") == {"type": "auto"}           # thinks first (a forced call skips it)
     assert tool_choice("claude-sonnet-5") == {"type": "tool", "name": "record_page"}
     assert tool_choice("claude-sonnet-5-5") == {"type": "auto"}          # refuses forced tool calls
     ex = Extractor.__new__(Extractor)
     ex.model = "claude-haiku-5-5"
     snap = Snapshot(url="https://x.org/", final_url="https://x.org/", title="t", text="x" * 500, status=200)
     params = ex.request_params(snap, src("X", "https://x.org/"), [], run.LISTING)
-    assert params["tool_choice"]["type"] == "tool"
+    assert params["tool_choice"] == {"type": "auto"}
     assert retarget(params, "claude-opus-5-5")["tool_choice"] == {"type": "auto"}
     assert retarget(params, "claude-sonnet-5")["tool_choice"] == {"type": "tool", "name": "record_page"}
+    # thinking is billed as output: the estimate allows for it
+    haiku_est = budget.estimate_request(retarget(params, "claude-haiku-5-5"))
+    forced = dict(params, tool_choice={"type": "tool", "name": "record_page"})
+    assert haiku_est > budget.estimate_request(forced)
+
+
+def test_a_reply_in_prose_gets_a_second_look(monkeypatch):
+    from extract import Extractor as E
+    resp = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="thinking", thinking="..."),
+                                                            SimpleNamespace(type="text", text="Here are the shows")])
+    data = E.parse(resp)
+    assert data["_no_answer"] and data["_truncated"]
+    monkeypatch.setattr(db, "cache_peek", lambda key, role: None)
+    ex = SimpleNamespace(model="small", escalate_model="big", escalations=0, answered=0)
+    assert run.second_look(ex, data, "u", "r") == "no answer in the form"
+    ok = E.parse(SimpleNamespace(stop_reason="tool_use", content=[
+        SimpleNamespace(type="thinking", thinking="..."),
+        SimpleNamespace(type="tool_use", input={"page_status": "has_performances", "productions": [], "detail_links": []})]))
+    assert ok["page_status"] == "has_performances" and not ok.get("_no_answer")
+
+
+def test_english_titles_of_the_last_reading_are_kept():
+    prev = {"productions": [{"title": "Carnations", "original_title": "Nelken"},
+                            {"title": "This World", "original_title": "Este Mundo"},
+                            {"title": "Giselle", "original_title": None}]}
+    new = {"productions": [{"title": "Nelken", "original_title": None},             # native title kept by the model
+                           {"title": "The World", "original_title": "Este Mundo"},   # another translation
+                           {"title": "Giselle", "original_title": None},
+                           {"title": "Drøm", "original_title": None}]}               # not in the last reading
+    assert run.keep_english_titles(new, prev) == 2
+    assert [p["title"] for p in new["productions"]] == ["Carnations", "This World", "Giselle", "Drøm"]
+    assert new["productions"][0]["original_title"] == "Nelken"
+    assert run.keep_english_titles(new, None) == 0
+
+
+def test_comparison_does_the_second_look_and_records_what_a_run_keeps(monkeypatch):
+    rows = []
+    monkeypatch.setattr(db, "compare_put", rows.append)
+    snap = Snapshot(url="https://x.org/", final_url="https://x.org/", title="t", text="x" * 500, status=200)
+    six = {"productions": [{"title": "Swan Lake", "performances": [{"date": FUTURE, "time": "19:30"}] * 6}]}
+    monkeypatch.setattr(db, "cache_peek", lambda key, role: {"text_hash": "old", "model": "claude-sonnet-5", "result": six})
+    answers = []
+
+    class Ex:
+        model, escalate_model, compare, compare_fresh_left = "small", "big", True, 5
+        answered = escalations = 0
+        pay = budget.NoBudget()
+
+        def read(self, snap, source, venues, role, model=None):
+            answers.append(model or "small")
+            if model == "big":
+                return {**six, "_model": "big"}
+            return {"productions": [{"title": "Swan Lake", "performances": [{"date": FUTURE, "time": "19:30"}]}],
+                    "_model": "small"}
+    final = run.read_page(Ex(), snap, src("X", "https://x.org/"), [], run.LISTING, True)
+    assert answers == ["small", "big"]                         # far fewer shows than last time: second look
+    row = rows[0]
+    assert row["second_look"].startswith("found 1 shows") and row["final_result"]["_model"] == "big"
+    assert row["ref_model"] == "big" and row["ref_from_cache"] is False   # the second look is the reference too
+    assert final["_model"] == "big"                            # the run follows what a normal run keeps
