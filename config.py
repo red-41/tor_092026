@@ -14,7 +14,11 @@ ESCALATE_MODEL = os.environ.get("ESCALATE_MODEL", "claude-sonnet-5")
 # Models that refuse a forced tool call (they answer with tool_choice "auto"; the prompt still says to call the tool).
 # Source: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use (checked 16 Oct 2026)
 NO_FORCED_TOOL = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"}
-ESCALATE_MAX_SHARE = float(os.environ.get("ESCALATE_MAX_SHARE", "0.15"))   # at most this share of a run's pages
+# Models that may think before answering. A forced tool call skips Haiku 5.5's thinking, and the test of 16 Oct 2026
+# showed the cost: shows left out of long calendars, workshops and concerts let in, date ranges written out, titles not
+# translated. These models get tool_choice "auto" (the prompt still requires the record_page call).
+LET_THINK = {m for m in os.environ.get("LET_THINK", "claude-haiku-5-5").split(",") if m.strip()}
+ESCALATE_MAX_SHARE = float(os.environ.get("ESCALATE_MAX_SHARE", "0.2"))    # at most this share of a run's pages
 ESCALATE_DROP = 0.5             # "far fewer": under half the shows of the last reading of the same page...
 ESCALATE_DROP_MIN = 3           # ...when that reading had at least this many
 # Readings by these models are reused for an unchanged page (a stronger model's reading is at least as good).
@@ -24,7 +28,8 @@ CACHE_MODELS = {MODEL, ESCALATE_MODEL, "claude-sonnet-5", "claude-sonnet-5-5", "
 MONTHLY_BUDGET_USD = float(os.environ.get("MONTHLY_BUDGET_USD") or 100)
 RUN_BUDGET_USD = float(os.environ.get("RUN_BUDGET_USD") or 25)
 BUDGET_BLOCK_USD = 0.25         # reserved from the ledger at a time
-EST_OUTPUT_TOKENS = 1500        # answer length assumed before an answer comes back (corrected afterwards)
+EST_OUTPUT_TOKENS = 1500        # answer length assumed before an answer comes back (corrected afterwards)...
+EST_OUTPUT_TOKENS_THINKING = 4500   # ...and for a model that thinks first (thinking is billed as output)
 # USD per million tokens: (input, output, cache write 5m, cache read). Batch API: half of these.
 # Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 16 Oct 2026)
 PRICES = {

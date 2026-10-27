@@ -53,7 +53,9 @@ def estimate_request(params: dict, batch: bool = False) -> float:
     fixed += estimate_tokens(str(params.get("tools") or ""))
     user = "".join(m["content"] if isinstance(m.get("content"), str) else str(m.get("content"))
                    for m in params.get("messages") or [])
-    return cost_usd(model, estimate_tokens(user), config.EST_OUTPUT_TOKENS, cache_read=fixed, batch=batch)
+    thinks = (params.get("tool_choice") or {}).get("type") == "auto" and model in config.LET_THINK
+    out = config.EST_OUTPUT_TOKENS_THINKING if thinks else config.EST_OUTPUT_TOKENS
+    return cost_usd(model, estimate_tokens(user), out, cache_read=fixed, batch=batch)
 
 
 class BudgetReached(Exception):

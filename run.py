@@ -54,10 +54,13 @@ def read_page(ex: Extractor, snap, source: dict, venues: list, role: str, use_ca
             ex.cache_hits += 1
             return hit
     data = ex.read(snap, source, venues, role=role)
-    why = second_look(ex, data, key, role)
+    prev = db.cache_peek(key, role)                   # the last reading of this page, before it is replaced
+    keep_english_titles(data, (prev or {}).get("result"))
+    why = second_look(ex, data, key, role, prev)
     if why:
         try:
             better = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
+            keep_english_titles(better, (prev or {}).get("result"))
             ex.escalations += 1
             better["_second_look"] = why
             data = better
@@ -76,7 +79,36 @@ def count_upcoming(data: dict | None, today: dt.date | None = None) -> int:
     return sum(1 for p in flatten(data) if isinstance(p.get("date"), str) and p["date"] >= today_s)
 
 
-def second_look(ex: Extractor, data: dict | None, key: str, role: str) -> str | None:
+_UNSET = object()
+
+
+def keep_english_titles(data: dict | None, prev: dict | None) -> int:
+    """Use the English title of the last reading of the same page again when this reading gives the production under
+    its title in the site's language ("Nelken" where the last reading had "Carnations", original "Nelken"), or under
+    another translation of the same original title: the show then matches the one already on the site.
+    Returns how many titles were changed."""
+    if not isinstance(data, dict) or not isinstance(prev, dict):
+        return 0
+    known = {}
+    for p in (prev.get("productions") or []):
+        if not isinstance(p, dict):
+            continue
+        title, orig = str(p.get("title") or "").strip(), str(p.get("original_title") or "").strip()
+        if title and orig and title.lower() != orig.lower():
+            known[orig.lower()] = (title, orig)
+    changed = 0
+    for p in (data.get("productions") or []):
+        if not isinstance(p, dict):
+            continue
+        title, orig = str(p.get("title") or "").strip(), str(p.get("original_title") or "").strip()
+        k = orig.lower() if orig and orig.lower() in known else title.lower()
+        if k in known and title != known[k][0] and (not orig or orig.lower() in (k, title.lower())):
+            p["title"], p["original_title"] = known[k]
+            changed += 1
+    return changed
+
+
+def second_look(ex: Extractor, data: dict | None, key: str, role: str, prev=_UNSET) -> str | None:
     """Why the first reading of a page should be checked by the stronger model, or None.
     Only for the first model's readings, and for at most ESCALATE_MAX_SHARE of the pages answered in this job."""
     em = getattr(ex, "escalate_model", None)
@@ -85,38 +117,88 @@ def second_look(ex: Extractor, data: dict | None, key: str, role: str) -> str | 
     ex.answered += 1
     if ex.escalations >= max(3, config.ESCALATE_MAX_SHARE * ex.answered):
         return None
+    if data.get("_no_answer"):
+        return "no answer in the form"
     if data.get("_truncated"):
         return "answer cut off"
-    if data.get("unsure"):
+    if data.get("complete") is False:
+        return "the reading says it left shows out"
+    if GAVE_UP.search(str(data.get("unsure") or "")):
         return "unsure: " + str(data["unsure"])[:100]
+    span = expanded_range(data)
+    if span:
+        return f"dates of a range written out one by one ({span})"
     n = count_upcoming(data)
-    prev = db.cache_peek(key, role)
+    if prev is _UNSET:
+        prev = db.cache_peek(key, role)
     p = count_upcoming((prev or {}).get("result"))
     if p >= config.ESCALATE_DROP_MIN and n < p * config.ESCALATE_DROP:
         return f"found {n} shows, {p} at the last reading"
     return None
 
 
+# words in a reading's own doubts that mean it did not record everything (the test of 16 Oct 2026)
+GAVE_UP = re.compile(r"(not (all|fully|every)|could not|couldn't|the rest|next call|placeholder|only the first|"
+                     r"recorded only|partly|partially|truncat|cut off|incomplete|not included|more (dates|productions|entries))",
+                     re.I)
+
+
+def expanded_range(data: dict) -> str | None:
+    """A production with 3 or more consecutive days and no start time anywhere: the signature of a date range
+    ("9-14 February") written out as one performance per day, which the rules forbid. Returns "first to last"."""
+    for prod in (data.get("productions") or []):
+        if not isinstance(prod, dict):
+            continue
+        perfs = [q for q in (prod.get("performances") or []) if isinstance(q, dict)]
+        if len(perfs) < 3 or any(str(q.get("time") or "").strip() for q in perfs):
+            continue
+        try:
+            days = sorted({dt.date.fromisoformat(str(q.get("date"))[:10]) for q in perfs})
+        except ValueError:
+            continue
+        if len(days) >= 3 and all((b - a).days == 1 for a, b in zip(days, days[1:])):
+            return f"{days[0]} to {days[-1]}"
+    return None
+
+
 def compare_read(ex: Extractor, snap, source: dict, venues: list, role: str, key: str, h: str) -> dict:
-    """--compare: read the page with the model under test, put the reference reading next to it (the earlier
-    reading of the same page text by a stronger model from the cache, else a fresh one while the allowance
-    lasts) and record both. The run follows the tested model's answer."""
+    """--compare: read the page as a normal run would (the tested model, the English titles of the last reading, and
+    the second look by the stronger model when a trigger fires), put a reference reading next to it (the earlier
+    reading of the same page text by a stronger model from the cache, else the second look if there was one, else a
+    fresh reading while the allowance lasts) and record all of it. The run follows the final reading."""
     data = ex.read(snap, source, venues, role=role)
-    ref, ref_model, from_cache, ref_usage = None, None, False, None
     prev = db.cache_peek(key, role)
+    keep_english_titles(data, (prev or {}).get("result"))
+    why = second_look(ex, data, key, role, prev)
+    final, second = data, None
+    if why:
+        try:
+            second = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
+            keep_english_titles(second, (prev or {}).get("result"))
+            ex.escalations += 1
+            final = second
+        except OutOfCredit:
+            pass
+    ref, ref_model, from_cache, ref_usage = None, None, False, None
     if prev and prev.get("text_hash") == h and prev.get("model") in config.COMPARE_REF_MODELS:
         ref, ref_model, from_cache = prev.get("result"), prev.get("model"), True
+    elif second is not None:
+        ref, ref_model, ref_usage = second, ex.escalate_model, second.get("_usage")
     elif ex.compare_fresh_left > 0 and ex.escalate_model:
         ex.compare_fresh_left -= 1
         ref = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
-        ref_model, ref_usage = ex.escalate_model, ref.pop("_usage", None)
+        ref_model, ref_usage = ex.escalate_model, ref.get("_usage")
+
+    def clean(d):
+        return None if d is None else {k: v for k, v in d.items() if k != "_usage"}
     s = source
     db.compare_put({"run_id": ex.pay.run_id if hasattr(ex.pay, "run_id") else None, "source_id": s.get("id"),
                     "source_name": s.get("name"), "tier": s.get("priority"), "url": key, "role": role,
                     "text_hash": h, "model": data.get("_model") or ex.model,
-                    "result": {k: v for k, v in data.items() if k != "_usage"}, "usage": data.get("_usage"),
-                    "ref_model": ref_model, "ref_result": ref, "ref_usage": ref_usage, "ref_from_cache": from_cache})
-    return data
+                    "result": clean(data), "usage": data.get("_usage"), "final_result": clean(final),
+                    "ref_model": ref_model, "ref_result": clean(ref), "ref_usage": ref_usage,
+                    "ref_from_cache": from_cache, "second_look": why})
+    return final
 
 
 def reusable(prev: dict | None, today: dt.date) -> bool:
@@ -757,7 +839,9 @@ def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
         role = DETAIL if kind == "detail" else LISTING
         ckey = url if kind == "detail" else snap.final_url
         if data is not None:
-            why = second_look(ex, data, ckey, role)
+            prev = db.cache_peek(ckey, role)              # the last reading of this page, before it is replaced
+            keep_english_titles(data, (prev or {}).get("result"))
+            why = second_look(ex, data, ckey, role, prev)
             params = batch.take_params(key) if why else None
             if params is not None:
                 retarget(params, ex.escalate_model)

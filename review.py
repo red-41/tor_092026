@@ -280,7 +280,9 @@ def main() -> int:
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--no-publish", action="store_true")
     ap.add_argument("--no-pages", action="store_true", help="do not read the listing pages")
-    ap.add_argument("--limit", type=int, default=200)
+    # cases of each kind per run (held rows, possible duplicate pairs, conflicts). 500: with Haiku deciding first a
+    # case costs about a tenth of a cent, and the 1,000+ held rows left by the runs of 2 and 5 October clear in two runs
+    ap.add_argument("--limit", type=int, default=int(os.environ.get("REVIEW_LIMIT") or 500))
     a = ap.parse_args()
 
     start = time.time()

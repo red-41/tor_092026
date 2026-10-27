@@ -122,10 +122,21 @@ Each run only reads the sources that are due.
 ## What it costs, and the caps (since 16 October 2026)
 
 - **Haiku 5.5 reads every page** (1/20 of Sonnet 5's price per token). A reading that looks doubtful gets a **second look
-  by Sonnet 5** (not 5.5: Sonnet 5.5 refuses the forced answer form the collector uses; same price): the answer was cut off, the model says it is unsure (`unsure`), or it found under half the shows of
-  the last reading of the same page (when that had 3 or more). At most 15% of a job's pages get a second look; the
-  better reading is the one kept. The duplicate check works the same way: Haiku decides, Sonnet looks again when Haiku is
-  less than 85% sure.
+  by Sonnet 5** (not 5.5: Sonnet 5.5 refuses the forced answer form the collector uses; same price) when: the answer was
+  cut off; the reading says it left shows out (`complete` false, or its doubts say it recorded only part); it wrote a
+  date range out as one show per day (3+ consecutive days, no times); or it found under half the shows of the last
+  reading of the same page (when that had 3 or more). At most 20% of a job's pages get a second look; the better
+  reading is the one kept. The duplicate check works the same way: Haiku decides, Sonnet looks again when Haiku is
+  less than 85% sure. (Test of 16 Oct 2026, 149 pages: Haiku alone found 79% of Sonnet's shows; with the second look
+  on 6-10% of pages, 97%.)
+- **Haiku thinks before it answers** (since 27 October 2026). A forced answer form skips Haiku's thinking; in the first
+  test that showed as shows left out of long calendars, workshops and concerts let in, date ranges written out as
+  days and titles left untranslated. Haiku now gets `tool_choice` "auto" (variable `LET_THINK`, default
+  `claude-haiku-5-5`); the prompt still requires the `record_page` call, and a reply without it gets the second look.
+  Thinking is billed as output, so a page costs a little more, still about a tenth of Sonnet.
+- **English titles are kept**: when a reading gives a production under its title in the site's language ("Nelken")
+  where the last reading of the same page had the English one ("Carnations"), the English title is used again, so the
+  show matches the one already on the site.
 - **Hard spending cap**: every request is paid from small blocks reserved in the table `collector_spend` before it is
   sent (estimated generously, corrected to the real cost when the answer comes back). When a block would take the month
   past `MONTHLY_BUDGET_USD` or the run past `RUN_BUDGET_USD`, nothing more is sent: what was found is kept, the rest stays
@@ -158,10 +169,11 @@ that comes before the usual one. A source with nothing on yet waits for the anno
 ## Model test (mode compare)
 
 Actions > Collect performances > Run workflow > mode **compare**. 40 sites from all tiers (4 jobs in parallel, about an
-hour) are read by `MODEL`. For every page, the stronger model's reading of the same page text is put next to it: the
-earlier reading from the cache when the page has not changed (free), else a fresh one (at most 15 per job). Nothing is
-written to the site. Results: table `model_comparison`, compared page by page in the view `model_comparison_pages`
-(shows found by each, missed, extra, titles, choreographers). Costs about $3.
+hour) are read exactly as a normal run would (thinking, English titles of the last reading, second look). For every
+page, a reference reading is put next to it: the stronger model's earlier reading of the same page text from the cache
+(free), else the second look if there was one, else a fresh reading (at most 15 per job). Nothing is written to the
+site. Results: table `model_comparison` (first reading, final reading, reference), compared page by page in the view
+`model_comparison_pages` (`m_` = first reading, `f_` = what a run keeps). Costs about $4-5.
 
 ## What protects the data
 
@@ -212,6 +224,8 @@ After each weekly run, the `blocked` sites are then retried from your computer w
 - In Supabase, `sources.status` and `sources.notes` show how each site went last time; the admin Sources page shows the same.
 - The publish job's summary lists what was published and what Claude decided; the full report (each case, verdict,
   confidence and reason) is the **review-report** artifact.
+- The duplicate check takes up to 500 cases of each kind per run (variable `REVIEW_LIMIT`), held rows first, within
+  150 minutes; the rest waits for the next run. Mode **review** runs only this step (publish and check, no reading of sites).
 - What still waits for a person: `select * from review_queue();`. To answer one yourself:
   `select apply_review('pair', 123, 'different');`, `select apply_review('held', 8685, 'same', '<performance id>');`,
   `select apply_review('conflict', 4, 'ignore_listings', null, array[5678]);`

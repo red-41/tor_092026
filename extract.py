@@ -125,6 +125,7 @@ TOOL = {
 SYSTEM = """You extract upcoming dance and ballet performances from theatre and festival websites for Saffitt, a dance calendar.
 Rules:
 - Only staged dance and ballet performances open to the public. Leave out workshops, classes, participatory sessions (also for children), open rehearsals, talks, guided tours, cinema screenings, exhibitions, amateur or school showcases, musicals and family musicals, and opera/concerts without dance.
+- A dance calendar or a dance tag does not make an event dance. Also leave out: concerts and recitals (a Bach partita evening, an orchestra programme), opera, circus and acrobatics, magic, film or film-concert, readings, installations, one-to-one or durational live art. Keep dance theatre and physical theatre only when choreography is the core of the piece.
 - Children's and family dance and ballet are wanted when the public can buy tickets, also on weekday mornings; tag them Family. Leave out only performances reserved for school groups ("school performance", "séance scolaire", "Schulvorstellung", "voorstelling voor scholen", booked by schools only), and children's plays, musicals, VR or digital experiences that are not dance (a children's piece stays only if it is ballet or dance).
 - Leave out folk, traditional and ethnic dance: folk ensembles, national folk dance companies, and shows built on folk dance (Hungarian, Transylvanian, Carpathian, Balkan, Irish, Indian classical, flamenco, tango shows and similar), also when a dance theatre presents them. This means flamenco performances themselves (flamenco shows, tablao, flamenco recitals). Established Spanish dance companies (for example Ballet Nacional de España, Ballet Español de la Comunidad de Madrid) stay: their work counts as flamenco-inspired ballet. When a show is on the line between flamenco and flamenco-inspired ballet or contemporary dance, keep it. Flamenco-inspired ballets and contemporary choreographies always stay in, and so does every work by Marcos Morau / La Veronal (for example Afanador), whatever company dances it. Shows by flamenco artists (for example Rocío Molina, Israel Galván) are left out, except when this site is a tier 0 or tier 1 venue or festival and it presents the show as contemporary dance, not as flamenco.
 - Only performances on or after today's date.
@@ -299,8 +300,10 @@ class Extractor:
                     data["notes"] = ((data.get("notes") or "") + " [answer cut off: page too long]").strip()
                     data["_truncated"] = True
                 return data
+        # no record_page call: cut off, or (with tool_choice "auto") the model answered in prose
         return {"page_status": "not_a_schedule", "productions": [], "detail_links": [], "_truncated": True,
-                "notes": "no answer (page too long)" if truncated else "no answer"}
+                "_no_answer": not truncated,
+                "notes": "no answer (page too long)" if truncated else "no answer in the form"}
 
     def read(self, snap, source: dict, venues: list[dict], role: str, model: str | None = None) -> dict:
         """One page answered straight away (full price), paid from the spending cap."""
@@ -329,8 +332,11 @@ class Extractor:
 
 
 def tool_choice(model: str, name: str = "record_page") -> dict:
-    """Force the answer form, except for models that refuse a forced tool call (the prompt asks for it anyway)."""
-    return {"type": "auto"} if model in config.NO_FORCED_TOOL else {"type": "tool", "name": name}
+    """Force the answer form, except for models that refuse a forced tool call and models that should think first
+    (a forced call skips thinking); the prompt asks for the call either way."""
+    if model in config.NO_FORCED_TOOL or model in config.LET_THINK:
+        return {"type": "auto"}
+    return {"type": "tool", "name": name}
 
 
 def retarget(params: dict, model: str) -> dict:
