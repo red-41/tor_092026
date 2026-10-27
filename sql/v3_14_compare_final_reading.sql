@@ -1,0 +1,11 @@
+-- Saffitt v3, part 14 (applied 27 October 2026 as migration v3_14_compare_final_reading).
+-- The second model test records what a normal run keeps (after the second look) next to the first reading:
+--   alter table public.model_comparison add column if not exists final_result jsonb;
+-- and the view model_comparison_pages gained second_look, f_shows, f_same_shows, f_missed, f_extra, second_look_done
+-- (live definition: select pg_get_viewdef('public.model_comparison_pages');).
+-- Summary of a test run:
+--   select count(*) pages, sum(r_shows) ref, sum(same_shows) first_same, sum(f_same_shows) final_same,
+--          sum(cardinality(extra)) first_extra, sum(cardinality(f_extra)) final_extra,
+--          count(*) filter (where second_look_done) second_looks
+--   from model_comparison_pages where run_id = '<GitHub run id>';
+alter table public.model_comparison add column if not exists final_result jsonb;
