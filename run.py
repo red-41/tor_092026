@@ -62,8 +62,12 @@ def read_page(ex: Extractor, snap, source: dict, venues: list, role: str, use_ca
             better = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
             keep_english_titles(better, (prev or {}).get("result"))
             ex.escalations += 1
-            better["_second_look"] = why
-            data = better
+            failed = second_failed(better, data)
+            if failed:
+                data["notes"] = ((data.get("notes") or "") + f" [second look {failed}: first reading kept]").strip()
+            else:
+                better["_second_look"] = why
+                data = better
         except OutOfCredit:
             pass                              # no budget left for a second look: keep the first reading
     if not data.get("_truncated"):
@@ -121,7 +125,8 @@ def second_look(ex: Extractor, data: dict | None, key: str, role: str, prev=_UNS
         return "no answer in the form"
     if data.get("_truncated"):
         return "answer cut off"
-    if data.get("complete") is False:
+    if data.get("complete") is False and (data.get("page_status") == "has_performances" or flatten(data)):
+        # (a list without dates says "incomplete" because the dates are on the show pages, which are opened anyway)
         return "the reading says it left shows out"
     if GAVE_UP.search(str(data.get("unsure") or "")):
         return "unsure: " + str(data["unsure"])[:100]
@@ -134,6 +139,18 @@ def second_look(ex: Extractor, data: dict | None, key: str, role: str, prev=_UNS
     p = count_upcoming((prev or {}).get("result"))
     if p >= config.ESCALATE_DROP_MIN and n < p * config.ESCALATE_DROP:
         return f"found {n} shows, {p} at the last reading"
+    return None
+
+
+def second_failed(second: dict | None, first: dict | None) -> str | None:
+    """Why a second look must not replace the first reading, or None. In the test of 27 October Sonnet 5 twice
+    answered "has performances" with no show listed where the first reading had them (Saint-Nazaire, DFDC)."""
+    if not isinstance(first, dict) or not flatten(first):
+        return None
+    if not isinstance(second, dict) or second.get("_no_answer"):
+        return "gave no answer"
+    if not flatten(second) and second.get("page_status") == "has_performances":
+        return "said the page has performances but listed none"
     return None
 
 
@@ -176,7 +193,7 @@ def compare_read(ex: Extractor, snap, source: dict, venues: list, role: str, key
             second = ex.read(snap, source, venues, role=role, model=ex.escalate_model)
             keep_english_titles(second, (prev or {}).get("result"))
             ex.escalations += 1
-            final = second
+            final = data if second_failed(second, data) else second
         except OutOfCredit:
             pass
     ref, ref_model, from_cache, ref_usage = None, None, False, None
@@ -848,12 +865,19 @@ def apply_batch(batch: Batch, finished: list, ex: Extractor) -> list[dict]:
                 try:
                     nk = batch.add(params, ctx)          # same source, same page: it keeps waiting for this answer
                     batch.second[nk] = why
+                    batch.first[nk] = data
                     ex.escalations += 1
                     continue
                 except OutOfCredit:
                     pass                                  # no budget left for a second look: keep the first reading
-            if key in batch.second:
-                data["_second_look"] = batch.second.pop(key)
+        if key in batch.second:
+            why, first = batch.second.pop(key), batch.first.pop(key, None)
+            failed = second_failed(data, first)
+            if failed:
+                data = first
+                data["notes"] = ((data.get("notes") or "") + f" [second look {failed}: first reading kept]").strip()
+            elif data is not None:
+                data["_second_look"] = why
         batch.forget(key)
         result["pending"] -= 1
         if not any(r is result for r in touched):

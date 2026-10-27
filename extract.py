@@ -292,7 +292,7 @@ class Extractor:
         truncated = getattr(resp, "stop_reason", None) == "max_tokens"
         for block in resp.content:
             if block.type == "tool_use":
-                data = dict(block.input)
+                data = lift_root_production(dict(block.input))
                 for key in ("productions", "detail_links", "listing_links"):
                     if key in data:
                         data[key] = _as_list(data[key])
@@ -377,6 +377,7 @@ class Batch:
         self.meta: dict[str, tuple[str, float]] = {}     # key -> (model, estimated cost already paid from the cap)
         self._packed: dict[str, bytes] = {}             # key -> the request, compressed (kept for a second look)
         self.second: dict[str, str] = {}                # key of a second-look request -> why it was asked
+        self.first: dict[str, dict] = {}                # key of a second-look request -> the first reading
 
     def add(self, params: dict, context) -> str:
         """Queue one page. Its estimated cost is paid from the spending cap now (raises OutOfCredit at the cap)."""
@@ -575,6 +576,20 @@ def runs_of(data: dict) -> list[dict]:
                         "expected": r.get("expected_performances") if isinstance(r.get("expected_performances"), int) else None,
                         "dates_page_url": r.get("dates_page_url") or None, "venue_event_url": r.get("venue_event_url") or None})
     return [r for r in out if r["title"]]
+
+
+def lift_root_production(data: dict) -> dict:
+    """Sonnet 5 sometimes writes one production's fields (title, company, performances...) straight into the answer
+    with "productions": [] (Staatstheater Nürnberg, test of 27 October): move them into a production of their own."""
+    perfs = data.get("performances")
+    if not isinstance(perfs, (list, str)) or _as_list(data.get("productions")):
+        return data
+    page_keys = set(TOOL["input_schema"]["properties"])
+    prod = {k: data.pop(k) for k in list(data) if k not in page_keys and not k.startswith("_")}
+    prod["performances"] = _as_list(perfs)
+    if prod["performances"]:
+        data["productions"] = [prod]
+    return data
 
 
 def _as_list(v) -> list:
