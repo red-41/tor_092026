@@ -19,7 +19,7 @@ on:
         description: "Only sources whose name contains this text"
         default: ""
       limit:
-        description: "collect: max sources per shard (12 shards run side by side)"
+        description: "collect: max sources per shard (20 shards run side by side)"
         default: "100"
       dry:
         description: "collect: read and report, write nothing"
@@ -53,9 +53,9 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false
-      max-parallel: 12
+      max-parallel: 20                 # the most GitHub runs at once on the free plan
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -66,11 +66,11 @@ jobs:
       - run: python -m playwright install --with-deps chromium
       - name: Preflight (free)
         if: env.MODE == 'preflight'
-        run: python preflight.py --shard ${{ matrix.shard }} --shards 12 ${NAME:+--name "$NAME"}
+        run: python preflight.py --shard ${{ matrix.shard }} --shards 20 ${NAME:+--name "$NAME"}
       - name: Collect
         if: env.MODE != 'preflight'
         run: |
-          python run.py --shard ${{ matrix.shard }} --shards 12 --limit "$LIMIT" \
+          python run.py --shard ${{ matrix.shard }} --shards 20 --limit "$LIMIT" \
             ${PRIORITY:+--priority "$PRIORITY"} ${NAME:+--name "$NAME"} $( [ "$DRY" = "true" ] && echo --dry )
       - uses: actions/upload-artifact@v4
         if: always()
