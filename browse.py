@@ -6,9 +6,10 @@ actively refuses automated visitors, the page is reported as blocked and skipped
 """
 import datetime as dt
 import gzip
-import io
 import json
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.robotparser
@@ -21,6 +22,7 @@ from playwright.sync_api import sync_playwright
 
 import config
 import lenses
+import stall
 
 # ---------------------------------------------------------------- cookie banners
 # Consent managers seen on European venue sites: their "reject" / "only necessary" buttons.
@@ -239,6 +241,41 @@ def detect_block(status: int, title: str, text: str, html: str) -> str:
     return ""
 
 
+def fetch(url: str, timeout: float = 20, total_s: float | None = None, max_bytes: int = 8_000_000,
+          headers: dict | None = None) -> httpx.Response:
+    """GET outside the browser with a limit on the whole download, not only on each wait: a server that sends a
+    few bytes every so often never trips a per-read timeout and kept jobs busy for hours (27 October).
+    The body is cut at max_bytes. Raises httpx.ReadTimeout when the download takes longer than total_s."""
+    total_s = total_s or config.DOWNLOAD_TOTAL_S
+    end = time.monotonic() + total_s
+    with httpx.Client(timeout=timeout, follow_redirects=True, verify=False, headers=headers or {}) as c:
+        with c.stream("GET", url) as r:
+            chunks, size = [], 0
+            for chunk in r.iter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= max_bytes:
+                    break
+                if time.monotonic() > end:
+                    raise httpx.ReadTimeout(f"download of {url} took longer than {total_s:.0f}s", request=r.request)
+            r._content = b"".join(chunks)
+    return r
+
+
+PDF_SCRIPT = ("import io, sys\nfrom pypdf import PdfReader\nr = PdfReader(io.BytesIO(sys.stdin.buffer.read()))\n"
+              "sys.stdout.write('\\n'.join((p.extract_text() or '') for p in r.pages[:40]))")
+
+
+def pdf_text(data: bytes, seconds: float | None = None) -> str:
+    """Text of a PDF, read in a separate process that is stopped after PDF_SECONDS (a malformed PDF can send the
+    PDF library into an endless loop, which no timer inside this process could break)."""
+    p = subprocess.run([sys.executable, "-c", PDF_SCRIPT], input=data, capture_output=True,
+                       timeout=seconds or config.PDF_SECONDS)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr.decode("utf-8", "ignore").strip().splitlines() or ["pdf error"])[-1][:200])
+    return p.stdout.decode("utf-8", "ignore").strip()
+
+
 def _slug(url: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", url.lower().split("//")[-1])[:90].strip("-")
 
@@ -255,8 +292,8 @@ class Robots:
         if root not in self._cache:
             rp = urllib.robotparser.RobotFileParser()
             try:
-                r = httpx.get(root + "/robots.txt", timeout=15, follow_redirects=True,
-                              headers={"User-Agent": config.BOT_UA}, verify=False)
+                r = fetch(root + "/robots.txt", timeout=15, total_s=30, max_bytes=500_000,
+                          headers={"User-Agent": config.BOT_UA})
                 rp.parse(r.text.splitlines() if r.status_code == 200 and "html" not in r.headers.get("content-type", "") else [])
             except Exception:
                 rp.parse([])
@@ -482,12 +519,9 @@ class Browser:
 
     def _load_pdf(self, snap: Snapshot) -> Snapshot:
         try:
-            from pypdf import PdfReader
-            r = httpx.get(snap.url, timeout=60, follow_redirects=True, verify=False,
-                          headers={"User-Agent": self.ua})
+            r = fetch(snap.url, timeout=30, total_s=90, max_bytes=30_000_000, headers={"User-Agent": self.ua})
             r.raise_for_status()
-            reader = PdfReader(io.BytesIO(r.content))
-            snap.text = "\n".join((p.extract_text() or "") for p in reader.pages[:40]).strip()
+            snap.text = pdf_text(r.content)
             snap.title, snap.final_url, snap.status = "PDF", str(r.url), r.status_code
         except Exception as e:
             snap.error = f"PDF: {type(e).__name__}: {str(e)[:150]}"
@@ -532,7 +566,7 @@ class Browser:
             if not self.robots.allowed(h):
                 continue
             try:
-                r = httpx.get(h, timeout=20, follow_redirects=True, verify=False, headers={"User-Agent": self.ua})
+                r = fetch(h, timeout=20, total_s=40, max_bytes=2_000_000, headers={"User-Agent": self.ua})
                 if r.status_code == 200 and "BEGIN:VCALENDAR" in r.text[:2000]:
                     events += lenses.parse_ics(r.text[:500_000])[:200]
             except Exception:
@@ -552,7 +586,8 @@ class Browser:
             sm = queue.pop(0)
             seen += 1
             try:
-                r = httpx.get(sm, timeout=25, follow_redirects=True, verify=False, headers={"User-Agent": config.BOT_UA})
+                stall.progress()
+                r = fetch(sm, timeout=25, total_s=60, max_bytes=8_000_000, headers={"User-Agent": config.BOT_UA})
                 if r.status_code != 200:
                     continue
                 body = r.content
@@ -572,6 +607,7 @@ class Browser:
     # -------------------------------------------------------- main entry
     def load(self, url: str) -> Snapshot:
         snap = Snapshot(url=url, final_url=url)
+        stall.progress()
         if not self.robots.allowed(url):
             snap.error = "blocked by robots.txt"
             return snap

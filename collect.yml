@@ -1,0 +1,175 @@
+name: Collect performances
+
+on:
+  schedule:
+    # Monday, Wednesday, Friday 01:00 UTC; each source is only read when it is due.
+    # Scheduled runs only happen when the repository variable AUTO_RUN is "true" (Settings > Variables > Actions).
+    - cron: "0 1 * * 1,3,5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight = free check that every site opens (no Claude). collect = read schedules, then publish with the duplicate check. review = only publish and check what is waiting. compare = model test on 40 sites (writes nothing to the site)."
+        type: choice
+        options: [preflight, collect, review, compare]
+        default: preflight
+      priority:
+        description: "collect: only this tier (0 = core, 1, 2 or 3); empty = all"
+        default: ""
+      name:
+        description: "Only sources whose name contains this text"
+        default: ""
+      limit:
+        description: "collect: max sources per shard (20 shards run side by side)"
+        default: "100"
+      dry:
+        description: "collect: read and report, write nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  # Haiku reads every page; doubtful readings get a second look by ESCALATE_MODEL (empty = none).
+  MODEL: ${{ vars.MODEL || 'claude-haiku-5-5' }}
+  ESCALATE_MODEL: ${{ vars.ESCALATE_MODEL || 'claude-sonnet-5' }}
+  # Spending cap in USD, shared by all jobs of a run: per calendar month and per run.
+  MONTHLY_BUDGET_USD: ${{ vars.MONTHLY_BUDGET_USD || '100' }}
+  RUN_BUDGET_USD: ${{ vars.RUN_BUDGET_USD || '25' }}
+  MODE: ${{ github.event.inputs.mode || 'collect' }}
+  NAME: ${{ github.event.inputs.name }}
+  PRIORITY: ${{ github.event.inputs.priority }}
+  LIMIT: ${{ github.event.inputs.limit || '100' }}
+  DRY: ${{ github.event.inputs.dry || 'false' }}
+
+jobs:
+  run:
+    if: (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'review' && github.event.inputs.mode != 'compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20                 # the most GitHub runs at once on the free plan
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Preflight (free)
+        if: env.MODE == 'preflight'
+        run: python preflight.py --shard ${{ matrix.shard }} --shards 20 ${NAME:+--name "$NAME"}
+      - name: Collect
+        if: env.MODE != 'preflight'
+        run: |
+          python run.py --shard ${{ matrix.shard }} --shards 20 --limit "$LIMIT" \
+            ${PRIORITY:+--priority "$PRIORITY"} ${NAME:+--name "$NAME"} $( [ "$DRY" = "true" ] && echo --dry )
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-shard-${{ matrix.shard }}
+          path: reports/
+          if-no-files-found: ignore
+
+  # Publish what was collected, with the duplicate check: clear matches become one more listing of a show,
+  # uncertain ones and possible duplicate pairs go to Claude, confident answers are applied, the rest wait.
+  publish:
+    needs: run
+    if: always() && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'preflight' && github.event.inputs.mode != 'compare' && github.event.inputs.dry != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python review.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review-report
+          path: reports/
+          if-no-files-found: ignore
+
+  summary:
+    needs: run
+    if: always() && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'compare'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-shard-*
+          path: all-reports
+          merge-multiple: true
+      - run: python combine.py all-reports
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-results
+          path: all-reports/
+
+  # Optional: sites that block GitHub's servers are retried from your own computer.
+  # Needs a self-hosted runner (see README) and the repository variable HOME_RUNNER = true.
+  from-home:
+    needs: run
+    if: always() && vars.HOME_RUNNER == 'true' && (github.event_name != 'schedule' || vars.AUTO_RUN == 'true') && github.event.inputs.mode != 'preflight' && github.event.inputs.mode != 'compare'
+    runs-on: self-hosted
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt && python -m playwright install chromium
+      - name: Retry blocked sources
+        run: python run.py --status blocked --limit 500 $( [ "$DRY" = "true" ] && echo --dry )
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-from-home
+          path: reports/
+          if-no-files-found: ignore
+
+  # Model test: 40 sites from all tiers read by MODEL; the stronger model's reading of the same pages is put next to
+  # each page (reused from last time when the page has not changed, else read fresh, at most 15 pages per job).
+  # Writes nothing to the site; the results are in the table model_comparison. Costs about $3.
+  compare:
+    if: github.event.inputs.mode == 'compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      COMPARE_FRESH_MAX: "15"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python run.py --compare 40 --shard ${{ matrix.shard }} --shards 4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compare-shard-${{ matrix.shard }}
+          path: reports/
+          if-no-files-found: ignore

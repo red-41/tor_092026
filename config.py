@@ -66,6 +66,13 @@ DETAIL_RESERVE_MINUTES = 45     # round 2: no page is opened in the last 45 minu
 BATCH_SEND_AT = 40              # production pages are sent to Claude in bundles of about this size...
 BATCH_SEND_EVERY_S = 600        # ...or every 10 minutes, whichever comes first, so sites are saved as they finish
 PAGE_HARD_LIMIT_S = 300         # a page still loading after 5 minutes has frozen the browser: it is restarted
+# a job with no progress at all for this long prints where it is stuck and ends (stall.py); the longest legitimate
+# wait is one Claude call with its retries (client timeout 420 s)
+STALL_MINUTES = float(os.environ.get("STALL_MINUTES", "30"))
+# a download outside the browser (robots.txt, sitemap, PDF, calendar file) may take this long in all, however slowly
+# the server sends it; a PDF is read in a separate process that is stopped after PDF_SECONDS
+DOWNLOAD_TOTAL_S = 60
+PDF_SECONDS = 60
 PAGE_TEXT_LIMIT = int(os.environ.get("PAGE_TEXT_LIMIT", "60000"))   # characters sent to the model per page
 FEED_TEXT_LIMIT = 8000          # characters of each background data feed sent along (up to 3 per page)
 SITEMAP_LIMIT = 200             # event/production addresses from a site's sitemap sent with its first schedule page

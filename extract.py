@@ -9,6 +9,7 @@ import anthropic
 
 import config
 import lenses
+import stall
 
 SOCIAL = re.compile(r"(facebook|instagram|twitter|x\.com|youtube|youtu\.be|vimeo|tiktok|linkedin|spotify|pinterest|"
                     r"google\.|apple\.com|mailto:|whatsapp|t\.me|flickr|soundcloud)", re.I)
@@ -310,6 +311,7 @@ class Extractor:
         import budget as _b
         params = self.request_params(snap, source, venues, role, model)
         est = self.spend(params, batch=False)
+        stall.progress()
         try:
             resp = self.client.messages.create(**params)
         except anthropic.APIStatusError as e:
@@ -501,6 +503,7 @@ class Batch:
         while self._open and not (until_any and out):
             if time.time() > deadline:
                 break
+            stall.progress()                     # waiting on Claude is progress: the batch is still running
             time.sleep(poll_s)
             out += self.poll(force=True)
         return out

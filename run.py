@@ -4,7 +4,7 @@ Usage:
   python run.py --limit 60                 # next 60 due sources
   python run.py --priority 0 --limit 200   # only the tier 0 core
   python run.py --name "Sadler"            # one source by name
-  python run.py --shard 2 --shards 12      # one of 12 parallel slices (GitHub matrix)
+  python run.py --shard 2 --shards 20      # one of 20 parallel slices (GitHub matrix)
   python run.py --status blocked           # retry every blocked source (from a home computer)
   python run.py --dry                      # read and report, write nothing to the site's tables
 """
@@ -25,6 +25,7 @@ import budget
 import config
 import db
 import lenses
+import stall
 from browse import Browser
 from extract import (Batch, Extractor, OutOfCredit, clean_performance, flatten, merge, page_hash, retarget, runs_of,
                      time_seen)
@@ -1036,6 +1037,8 @@ def main(argv=None):
     ex.budget = pay
     if args.compare:
         ex.compare, ex.compare_fresh_left = True, config.COMPARE_FRESH_MAX
+    if sources:
+        stall.arm()                       # a job stuck for STALL_MINUTES prints where and ends (see stall.py)
     if sources and not pay.open():
         ex.stop(pay.stopped or "the spending cap is reached", capped=True)
         print(f"Nothing is sent to Claude: {ex.stop_note}. The sources stay due.", flush=True)
@@ -1110,6 +1113,7 @@ def main(argv=None):
                 skipped.append(s)
                 continue
             print(f"-> {s['name']}", flush=True)
+            stall.progress()
             try:
                 results.append(start_source(br, ex, s, use_cache, listings))
             except OutOfCredit:
@@ -1136,6 +1140,7 @@ def main(argv=None):
                     res["saved"] = True
                     continue
                 print(f"=> {s['name']}", flush=True)
+                stall.progress()
                 try:
                     continue_source(br, ex, res, use_cache, details,
                                     stop_at=time.time() if ex.out_of_credit else stop_pages, listing_batch=details)
@@ -1160,6 +1165,7 @@ def main(argv=None):
 
             # Wait for the last answers (they may open more pages), saving sources as they complete.
             while any(b.busy for b in batches) and time.time() < job_end:
+                stall.progress()
                 heartbeat()
                 for b in batches:
                     if b.unsent:
@@ -1195,6 +1201,7 @@ def main(argv=None):
                                   else "the Anthropic credit ran out") + " before this source; it stays due for the next run"]})
     pay.close()
     write_report(report, ex, args, [b for b in (listings, details) if b], credit_out=ex.out_of_credit)
+    stall.disarm()
     return 0
 
 
@@ -1240,6 +1247,7 @@ def harvest_pending(ex: Extractor) -> int:
     stored = 0
     now = dt.datetime.now(dt.timezone.utc)
     for bid, items in by_batch.items():
+        stall.progress()
         try:
             age = max((now - dt.datetime.fromisoformat(r["updated_at"])).days for r in items if r.get("updated_at"))
         except Exception:

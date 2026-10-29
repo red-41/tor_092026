@@ -119,8 +119,9 @@ def page_text(url: str) -> str:
     if not url or not url.startswith("http") or not _allowed(url):
         return ""
     try:
-        r = httpx.get(url, timeout=25, follow_redirects=True,
-                      headers={"User-Agent": config.USER_AGENT or config.BOT_UA, "Accept-Language": "en,*;q=0.5"})
+        from browse import fetch                  # whole download limited: a slow server cannot stall the review
+        r = fetch(url, timeout=25, total_s=60, max_bytes=5_000_000,
+                  headers={"User-Agent": config.USER_AGENT or config.BOT_UA, "Accept-Language": "en,*;q=0.5"})
         if r.status_code >= 400 or "html" not in r.headers.get("content-type", "html"):
             return ""
         t = re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", r.text)
