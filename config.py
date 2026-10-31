@@ -66,6 +66,7 @@ DETAIL_RESERVE_MINUTES = 45     # round 2: no page is opened in the last 45 minu
 BATCH_SEND_AT = 40              # production pages are sent to Claude in bundles of about this size...
 BATCH_SEND_EVERY_S = 600        # ...or every 10 minutes, whichever comes first, so sites are saved as they finish
 PAGE_HARD_LIMIT_S = 300         # a page still loading after 5 minutes has frozen the browser: it is restarted
+WATCH_DRIVER_S = 60             # ...and if the call still waits this long after that, Playwright itself is restarted
 # a job with no progress at all for this long prints where it is stuck and ends (stall.py); the longest legitimate
 # wait is one Claude call with its retries (client timeout 420 s)
 STALL_MINUTES = float(os.environ.get("STALL_MINUTES", "30"))
