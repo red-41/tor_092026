@@ -310,6 +310,78 @@ class Robots:
             return []
 
 
+def _kill_children(driver: bool) -> int:
+    """Stop the browser's processes (driver=False) or the Playwright driver that talks to it (driver=True)."""
+    import psutil
+    n = 0
+    for p in psutil.Process().children(recursive=True):
+        try:
+            cmd = " ".join(p.cmdline())
+            is_driver = "run-driver" in cmd
+            is_browser = not is_driver and ("chrom" in p.name().lower() or "chrom" in cmd or "--type=" in cmd)
+            if (driver and is_driver) or (not driver and is_browser):
+                p.kill()
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+class _Watch:
+    """Watchdog for one browser step (opening a page, closing it, restarting the browser). Every call to the browser
+    waits for an answer that may never come: in the runs of 27 and 29 October six jobs hung that way outside the
+    old watchdog, which only covered loading the page.
+    Level 1 (after `seconds`): the browser's processes are stopped, so the waiting call fails and the next page gets
+    a fresh browser. Level 2 (60 s later, if the call is still waiting): the Playwright driver is stopped too, and a
+    new one is started for the next page."""
+
+    def __init__(self, br, seconds: float, what: str):
+        self.br, self.seconds, self.what = br, seconds, what
+        self._t1 = self._t2 = None
+        self._done = False
+        self._lock = threading.Lock()
+
+    def start(self) -> "_Watch":
+        self._t1 = threading.Timer(self.seconds, self._level1)
+        self._t1.daemon = True
+        self._t1.start()
+        return self
+
+    def _level1(self):
+        with self._lock:
+            if self._done:
+                return
+            self.br._dead = True
+            print(f"watchdog: {self.what} still waiting after {self.seconds:.0f}s; stopping the browser", flush=True)
+            try:
+                _kill_children(driver=False)
+            except Exception as e:
+                print(f"watchdog: could not stop the browser ({type(e).__name__})", flush=True)
+            self._t2 = threading.Timer(config.WATCH_DRIVER_S, self._level2)
+            self._t2.daemon = True
+            self._t2.start()
+
+    def _level2(self):
+        with self._lock:
+            if self._done:
+                return
+            self.br._driver_dead = True
+            print(f"watchdog: {self.what} still waiting {config.WATCH_DRIVER_S:.0f}s after the browser was stopped; "
+                  "restarting Playwright",
+                  flush=True)
+            try:
+                _kill_children(driver=True)
+            except Exception as e:
+                print(f"watchdog: could not stop Playwright ({type(e).__name__})", flush=True)
+
+    def stop(self):
+        with self._lock:
+            self._done = True
+            for t in (self._t1, self._t2):
+                if t is not None:
+                    t.cancel()
+
+
 class Browser:
     """shots: None (no screenshots), 'problems' (only blocked/empty pages) or 'always'."""
 
@@ -318,8 +390,13 @@ class Browser:
         self.shots = shots if shots_dir else None
 
     def __enter__(self):
+        self._dead = self._driver_dead = False
         self._pw = sync_playwright().start()
-        self._launch()
+        w = _Watch(self, 180, "starting the browser").start()
+        try:
+            self._launch()
+        finally:
+            w.stop()
         self.robots = Robots()
         self._sitemaps = {}
         if self.shots_dir:
@@ -341,38 +418,51 @@ class Browser:
         self._dead = False
         self.restarts = getattr(self, "restarts", 0)
 
-    def _freeze(self):
-        """Watchdog: a page is still loading after PAGE_HARD_LIMIT_S. A stuck script can block the browser for
-        ever, so the browser is stopped (the waiting call then fails) and load() starts a fresh one."""
-        self._dead = True
-        print(f"watchdog: a page froze for {config.PAGE_HARD_LIMIT_S}s; restarting the browser", flush=True)
+    def _new_driver(self):
+        """The Playwright driver was stopped by the watchdog: start a new one (tested: this works in one process)."""
         try:
-            import psutil
-            for p in psutil.Process().children(recursive=True):
-                try:
-                    name = p.name().lower()
-                    if "chrom" in name or "headless_shell" in name:
-                        p.kill()
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"watchdog: could not stop the browser ({type(e).__name__})", flush=True)
+            self._pw.stop()
+        except Exception:
+            pass
+        try:
+            _kill_children(driver=False)
+        except Exception:
+            pass
+        self._pw = sync_playwright().start()
+        self._driver_dead = False
 
     def _restart(self):
-        for closer in (lambda: self._ctx.close(), lambda: self._browser.close()):
+        """A fresh browser (after a frozen page, or when pages come back nearly empty). Closing the old one is
+        watched too: a wedged browser may never answer the request to close."""
+        self.restarts = getattr(self, "restarts", 0) + 1
+        if not getattr(self, "_driver_dead", False):
+            w = _Watch(self, 60, "closing the browser").start()
             try:
-                closer()
-            except Exception:
-                pass
-        self.restarts += 1
-        self._launch()
+                for closer in (lambda: self._ctx.close(), lambda: self._browser.close()):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+            finally:
+                w.stop()
+        if getattr(self, "_driver_dead", False):
+            self._new_driver()
+        w = _Watch(self, 180, "starting the browser").start()
+        try:
+            self._launch()
+        finally:
+            w.stop()
 
     def __exit__(self, *exc):
-        for closer in (lambda: self._ctx.close(), lambda: self._browser.close(), lambda: self._pw.stop()):
-            try:
-                closer()
-            except Exception:
-                pass
+        w = _Watch(self, 60, "closing the browser at the end").start()
+        try:
+            for closer in (lambda: self._ctx.close(), lambda: self._browser.close(), lambda: self._pw.stop()):
+                try:
+                    closer()
+                except Exception:
+                    pass
+        finally:
+            w.stop()
 
     # -------------------------------------------------------- cookie banners
     def _click_first(self, frame, selectors) -> bool:
@@ -614,10 +704,9 @@ class Browser:
         if urlparse(url).path.lower().endswith(".pdf"):
             time.sleep(config.DELAY_SECONDS)
             return self._load_pdf(snap)
-        if self._dead:
+        if self._dead or getattr(self, "_driver_dead", False):
             self._restart()
-        watchdog = threading.Timer(config.PAGE_HARD_LIMIT_S, self._freeze)
-        watchdog.daemon = True
+        watch = _Watch(self, config.PAGE_HARD_LIMIT_S, f"the page {url}")
         page = None
         captured = []
 
@@ -634,9 +723,9 @@ class Browser:
             except Exception:
                 pass
         try:
+            watch.start()                      # from opening the tab to closing it: every browser call is watched
             page = self._ctx.new_page()
             page.on("response", on_response)
-            watchdog.start()
             resp = None
             for attempt in (1, 2):
                 try:
@@ -711,14 +800,14 @@ class Browser:
         except Exception as e:  # network errors, timeouts, crashes
             snap.error = f"{type(e).__name__}: {str(e)[:200]}"
         finally:
-            watchdog.cancel()
-            if self._dead:
-                snap.error = f"page froze for {config.PAGE_HARD_LIMIT_S}s; browser restarted"
-            else:
+            if not self._dead:
                 try:
                     if page is not None and not page.is_closed():
                         page.close()
                 except Exception:
                     pass
+            watch.stop()
+            if self._dead:
+                snap.error = f"page froze for {config.PAGE_HARD_LIMIT_S}s; browser restarted"
             time.sleep(config.DELAY_SECONDS)
         return snap
