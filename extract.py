@@ -143,7 +143,7 @@ Rules:
 - Never turn a date range into individual dates: "9-14 February" or "du 21 au 23 octobre" is a run (start, end), not one performance per day. List only dates that are written on the page or in its data. If a venue's run shows only a range, or fewer dates than announced, describe it in the production's runs (start, end, how many performances are announced, where the individual dates may be). Exception: if the page states a weekly pattern ("Thu and Fri 20:30, Sat 16:30 and 20:30"), work out the dates from it and mark them date_basis "pattern".
 - Touring: every date belongs to the venue, city and country shown with that date, also in small print ("on tour", "Gastspiel", "en tournée", "gira", a city name or a flag). On a venue's own schedule, a date marked with another venue or city happens there, not at the house. Never fill in the house or the company's home city for a date that names another place; leave venue null when no place is given.
 - Give each performance the IANA time zone of its venue's location.
-- Times are local wall-clock times at the venue. Background data often stores times in UTC or with an offset ("2026-10-01T17:30:00Z", "+02:00"): convert them to the venue's local time. When the page text shows a time, that time wins.
+- Times are local wall-clock times at the venue. Background data often stores times in UTC or with an offset ("2026-10-01T17:30:00Z", "+02:00"): convert them to the venue's local time. When the page text shows a time, that time wins, unless the editors' note about the site says otherwise.
 - List each performance once. The same show on the same date must not appear twice at different times (for example a UTC copy one or two hours off) or once with and once without its venue.
 - title is the name of the work or programme, never the company's name alone and never a tour label ("International Tour", "On tour", "Gastspiel"). If the page gives only the company and a tour label, use the work's name from the page; if there is none, leave the item out.
 - Background data and calendar files, when given, are part of the page: read the dates in them.
@@ -249,11 +249,12 @@ class Extractor:
         events = json.dumps(snap.events, ensure_ascii=False)[:lim["events"]] if snap.events else ""
         feeds = (getattr(snap, "feeds", None) or []) if lim["feeds"] else []
         sitemap = (getattr(snap, "sitemap", None) or [])[:lim["sitemap"]]
-        return (
+        return clean_text(
             f"Today: {today}\n"
             f"Source: {source.get('name')} ({source.get('kind')}, tier {source.get('priority')}), {source.get('city')}, {source.get('country')}. "
             f"Time zone {source.get('timezone')}.\n"
-            f"This page is a {role}.\nURL: {snap.final_url}\nPage title: {snap.title}\n"
+            + (f"Note about this site from the editors (follow it): {source['reader_note']}\n" if source.get("reader_note") else "")
+            + f"This page is a {role}.\nURL: {snap.final_url}\nPage title: {snap.title}\n"
             f"og:image: {snap.og_image}\n\n"
             f"Known venues in this country (reuse exact names): {'; '.join(venue_names) or 'none'}\n\n"
             + (f"Structured event data found in the page (schema.org and calendar files):\n{events}\n\n" if events else "")
@@ -383,6 +384,9 @@ class Batch:
 
     def add(self, params: dict, context) -> str:
         """Queue one page. Its estimated cost is paid from the spending cap now (raises OutOfCredit at the cap)."""
+        # encoded first: a request that cannot be sent fails here, for its own site only, and is never queued
+        # (queued, it would make the whole bundle fail at sending and stop the job)
+        packed = json.dumps(params, ensure_ascii=False).encode()
         est = self.ex.spend(params, batch=True)
         key = f"p{len(self.requests):06d}"
         self.requests.append(key)
@@ -390,7 +394,7 @@ class Batch:
         self.context[key] = context
         self.meta[key] = (params.get("model") or self.ex.model, est)
         if getattr(self.ex, "escalate_model", None):
-            self._packed[key] = zlib.compress(json.dumps(params, ensure_ascii=False).encode(), 6)
+            self._packed[key] = zlib.compress(packed, 6)
         return key
 
     def take_params(self, key: str) -> dict | None:
@@ -554,7 +558,19 @@ def page_hash(snap) -> str:
         body += "\nFEEDS:" + " ".join(sorted({d for f in feeds for d in DATE_IN_FEED.findall(f.get("text", ""))}))
     if getattr(snap, "sitemap", None):
         body += "\nSITEMAP:" + " ".join(sorted(snap.sitemap))
-    return hashlib.sha256(body.encode()).hexdigest()
+    return hashlib.sha256(clean_text(body).encode()).hexdigest()
+
+
+SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def clean_text(s: str) -> str:
+    """Text that can be sent as UTF-8. Pages built by JavaScript sometimes split a character outside the basic range
+    (styled letters like "𝐔𝐥𝐭𝐢𝐦𝐚", emoji) into two halves, or keep only one half: halves that belong together are
+    joined again, a lone half becomes "�". Without this one such character stops the whole job (UnicodeEncodeError)."""
+    if not s or not SURROGATE.search(s):
+        return s
+    return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
 DATE_IN_FEED = re.compile(r"20\d\d-[01]\d-[0-3]\d(?:[T ][0-2]\d:[0-5]\d)?")
