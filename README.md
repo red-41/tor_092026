@@ -3,7 +3,7 @@
 Reads the dance and ballet schedules of every website in the Saffitt `sources` table, puts the performances into the staging table, then publishes them with a duplicate check in between.
 
 ```
-sources ──> collect (12 jobs in parallel) ──> import_staging_performances ──> publish (review.py) ──> performances
+sources ──> collect (20 jobs in parallel) ──> import_staging_performances ──> publish (review.py) ──> performances
             headless browser + Claude                                          matching, duplicate check,   + performance_sources
             reads pages                                                        Claude reviews unsure cases    (one row per site)
 ```
@@ -35,7 +35,9 @@ Runs after the collect jobs (or alone: mode **review**).
    site says and the text of the listing pages. It answers same / different, which row to keep, or which listing is wrong.
 4. **Only confident answers are applied** (confidence 0.85 or more; variable `REVIEW_MIN_CONFIDENCE`). A merge moves every
    listing to the kept row and snapshots the removed one in `duplicate_review`. Everything else stays open with Claude's
-   reasoning, for a person: `select * from review_queue();`
+   reasoning (a note starting "unsure <date>"), for a person. Such a case is not sent to Claude again for 14 days, so
+   runs do not pay for the same doubt twice (`unsure_recently()`, sql/v3_15). Cases whose shows are all past are closed
+   by housekeeping and never sent.
 
 ## What it does for each website
 
@@ -198,7 +200,18 @@ site. Results: table `model_comparison` (first reading, final reading, reference
   was still with Claude is left untouched and due.
 - **Finding the dance programme**: when a homepage shows no dance but links to the dance programme, dance filter or calendar,
   that page is read and becomes the site's schedule page. Programme overview pages open their show pages (one level down).
-- **Even split**: sites are dealt to the 12 jobs like cards, so every job gets the same number of sites from each tier.
+- **Even split**: sites are dealt to the 20 jobs like cards, so every job gets the same number of sites from each tier.
+  20 is the most GitHub runs at once on the free plan.
+- **No more frozen jobs** (run of 27 October: 6 of 12 jobs hung on one website each until GitHub stopped them after
+  almost six hours): every download outside the browser has a limit on its whole length, not only on each wait
+  (`browse.fetch`), a PDF is read in a separate process stopped after a minute, and a job with no progress for
+  `STALL_MINUTES` (30) prints where it is stuck (a block starting with "Timeout" in the job's log) and ends. The sites
+  it had saved stay saved; the rest stay due for the next run.
+- **Browser watchdog on every browser call** (run of 29 October: the stall guard showed all six frozen jobs waiting
+  on the browser, outside the old watchdog that only covered loading the page): opening a tab, reading the page,
+  closing it and restarting the browser are all watched. After `PAGE_HARD_LIMIT_S` the browser is stopped; if the
+  call still waits `WATCH_DRIVER_S` later, Playwright itself is restarted. Either way the job moves on to the next
+  page with a fresh browser.
 - **Safety limits**: every job finishes within 320 minutes (GitHub stops jobs at 355). A page that freezes the browser for
   5 minutes is abandoned and the browser restarted, so one bad site cannot stall a job.
 - **Credit runs out, the Console spend limit or our own cap is reached**: the run stops sending pages, saves everything
@@ -226,9 +239,22 @@ After each weekly run, the `blocked` sites are then retried from your computer w
   confidence and reason) is the **review-report** artifact.
 - The duplicate check takes up to 500 cases of each kind per run (variable `REVIEW_LIMIT`), held rows first, within
   150 minutes; the rest waits for the next run. Mode **review** runs only this step (publish and check, no reading of sites).
-- What still waits for a person: `select * from review_queue();`. To answer one yourself:
+- What waits for Claude's next look: `select * from review_queue();`. What waits for a person:
+  `select staging_id, review_note from match_review where status = 'open' and review_note like 'unsure %';` (and the
+  same on `duplicate_review` where `status = 'proposed'`, and `performance_conflicts.note`). To answer one yourself:
   `select apply_review('pair', 123, 'different');`, `select apply_review('held', 8685, 'same', '<performance id>');`,
   `select apply_review('conflict', 4, 'ignore_listings', null, array[5678]);`
+
+### After a run, step by step
+
+1. Wait until the **publish** job is green. It publishes what was read and runs the duplicate check on its own.
+2. Open the publish job's summary: how many rows were published, held, merged, and left "unsure".
+3. Anything still waiting for Claude (more than 500 of a kind, or the 150 minutes ran out) is cleared by running the
+   workflow again with `mode` = **review**: no sites are read, it only publishes and checks (a few dollars). Repeat until
+   this shows nothing: `select x->>'kind', count(*) from jsonb_array_elements(review_queue(2000)) x group by 1;`
+4. What is left is waiting for a person: the "unsure" cases above and names in `credit_review` (status `open`,
+   answered with `select resolve_credit_review(<id>, '<choreographer id>')`, or `null` to ignore). Answer them with
+   the functions above, or ask Claude to go through them.
 
 ## Running by hand
 
@@ -236,7 +262,7 @@ Actions > Collect performances > Run workflow, with optional inputs:
 - `priority`: only 0 (core), 1, 2 or 3
 - `name`: only sources whose name contains this text (to retry one site)
 - `mode`: preflight (free check), collect, review (publish only) or compare (model test)
-- `limit`: sources per shard (12 shards run in parallel)
+- `limit`: sources per shard (20 shards run in parallel)
 - `dry`: read and report only
 
 Locally: `pip install -r requirements.txt && python -m playwright install chromium`, set the three environment variables, then `python run.py --name "Sadler" --dry`.

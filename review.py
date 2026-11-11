@@ -63,6 +63,13 @@ with different shows, a talk or workshop next to the show.
 One website listing the same piece twice on one day with two different times: two sessions (school shows at
 09:00 and 10:30, a matinee and an evening) unless its page shows only one of the times, then the other is stale.
 A touch tour or pre-show talk an hour or so before a show is not a separate performance.
+A listing for a whole evening (its title is the programme, or several piece titles joined by "/" or "+") at the
+same venue, date and start as published rows for the pieces of that evening is the same performance: answer "same"
+and keep the row of the first piece, or the row whose title is the programme.
+A listing with no time for a work on a day when the host venue or the same website lists timed sessions of that
+work at that venue is the same performance as the first session that day: answer "same" and keep that session.
+When the same website gives two different times for one performance, the reading it made last (last_seen) is
+right, unless its page says otherwise.
 
 Which row to keep for a duplicate: the richer one, the row with more data (more websites listing it, a real start
 time, fuller credits, an English title with the original); if equal, the one listed by the host venue's own
