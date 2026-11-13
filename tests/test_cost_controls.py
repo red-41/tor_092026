@@ -187,7 +187,11 @@ def test_second_look_reasons_and_its_limit(monkeypatch):
     ex = SimpleNamespace(model="small", escalate_model="big", escalations=0, answered=0)
     monkeypatch.setattr(db, "cache_peek", lambda key, role: None)
     assert run.second_look(ex, {"_truncated": True, "productions": []}, "u", "r") == "answer cut off"
-    assert run.second_look(ex, {"complete": False, "productions": []}, "u", "r") == "the reading says it left shows out"
+    assert run.second_look(ex, {"complete": False, "page_status": "has_performances", "productions": []},
+                           "u", "r") == "the reading says it left shows out"
+    # a list without dates is "incomplete" because the dates are on the show pages, which are opened anyway
+    assert run.second_look(ex, {"complete": False, "page_status": "listing_without_dates", "productions": []},
+                           "u", "r") is None
     assert run.second_look(ex, {"unsure": "I recorded only the first production", "productions": []},
                            "u", "r").startswith("unsure")
     assert run.second_look(ex, {"unsure": "times are not published", "productions": []}, "u", "r") is None
@@ -455,3 +459,39 @@ def test_comparison_does_the_second_look_and_records_what_a_run_keeps(monkeypatc
     assert row["second_look"].startswith("found 1 shows") and row["final_result"]["_model"] == "big"
     assert row["ref_model"] == "big" and row["ref_from_cache"] is False   # the second look is the reference too
     assert final["_model"] == "big"                            # the run follows what a normal run keeps
+
+
+# ---------- the test of 27 October: Sonnet 5's empty or misplaced answers ----------
+
+def test_a_production_written_at_the_top_of_the_answer_is_lifted():
+    block = SimpleNamespace(type="tool_use", input={
+        "page_status": "has_performances", "productions": [], "complete": True,
+        "title": "Les Ballets Actuels", "company": "Ballett am Staatstheater Nürnberg",
+        "performances": [{"date": "2026-10-27", "time": "19:30"}, {"date": "2026-10-30", "time": "19:30"}]})
+    data = Extractor.parse(SimpleNamespace(content=[block], stop_reason="tool_use"))
+    assert [p["title"] for p in data["productions"]] == ["Les Ballets Actuels"]
+    assert len(data["productions"][0]["performances"]) == 2 and "performances" not in data
+    assert data["page_status"] == "has_performances" and data["complete"] is True
+
+
+def test_an_empty_second_look_does_not_replace_the_first_reading(monkeypatch):
+    first = {"_model": "small", "page_status": "has_performances", "complete": False,
+             "productions": [{"title": "Trajectoires", "performances": [{"date": FUTURE, "time": "20:00"}] * 5}]}
+    empty = {"_model": "big", "page_status": "has_performances", "productions": [], "complete": True}
+    calls = []
+
+    def read(snap, source, venues, role=None, model=None):
+        calls.append(model)
+        return dict(empty) if model == "big" else dict(first, productions=list(first["productions"]))
+    ex = SimpleNamespace(model="small", escalate_model="big", escalations=0, answered=0, read=read)
+    monkeypatch.setattr(db, "cache_peek", lambda key, role: None)
+    monkeypatch.setattr(db, "cache_put", lambda *a: None)
+    snap = Snapshot(url="https://t.fr/", final_url="https://t.fr/", title="t", text="x" * 500, status=200)
+    data = run.read_page(ex, snap, src("T", "https://t.fr/"), [], run.LISTING, False)
+    assert calls == [None, "big"] and data["productions"][0]["title"] == "Trajectoires"
+    assert "first reading kept" in data["notes"]
+    # a second look that finds the shows does replace it
+    assert run.second_failed({"page_status": "has_performances", "productions": first["productions"]}, first) is None
+    # a reading that is right to find nothing (a list whose dates are on the show pages) is not overruled
+    assert run.second_failed({"page_status": "listing_without_dates", "productions": []}, first) is None
+    assert run.second_failed(None, first) == "gave no answer"

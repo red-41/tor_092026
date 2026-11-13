@@ -68,9 +68,50 @@ def test_low_confidence_is_left_for_a_person():
     assert c["p_verdict"] == "unsure" and c["p_keep"] is None
 
 
-def test_keep_must_be_one_of_the_pair():
-    c = review.to_call(PAIR, {"verdict": "same", "keep": "Z", "confidence": 0.99, "reason": "x"})
-    assert c["p_verdict"] == "unsure"
+def test_unusable_keep_falls_back_to_the_richer_row():
+    # the 5 October run left confident duplicates for a person only because the keep field was not a full id
+    rich = {"kind": "pair", "id": 8,
+            "a": {"id": "A", "time": "19:00", "listed_by": [{"rank": 3}]},
+            "b": {"id": "B", "time": "19:00", "ticket_url": "https://t", "venue": "Opera",
+                  "listed_by": [{"rank": 1}, {"rank": 3}]}}
+    for keep in ("Z", None, ""):
+        c = review.to_call(rich, {"verdict": "same", "keep": keep, "confidence": 0.95, "reason": "x"})
+        assert c["p_verdict"] == "same" and c["p_keep"] == "B"
+
+
+def test_keep_given_as_a_label_or_short_id_is_read():
+    pair = {"kind": "pair", "id": 9, "a": {"id": "2c503860-cfd3-4f87", "listed_by": []},
+            "b": {"id": "5de58af0-9045-4814", "listed_by": [{"rank": 1}, {"rank": 3}]}}
+    for keep in ("a", "Row A", "2c503860"):
+        assert review.to_call(pair, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})["p_keep"] == "2c503860-cfd3-4f87"
+
+
+def test_held_with_several_candidates_needs_a_real_answer():
+    held = {"kind": "held", "id": 5, "candidates": [{"id": "c1-aaaaaaaa"}, {"id": "c2-bbbbbbbb"}]}
+    assert review.to_call(held, {"verdict": "same", "keep": "x", "confidence": 0.95, "reason": "x"})["p_verdict"] == "unsure"
+    assert review.to_call(held, {"verdict": "same", "keep": "c2-bbbbbbbb", "confidence": 0.95, "reason": "x"})["p_keep"] == "c2-bbbbbbbb"
+    one = {"kind": "held", "id": 6, "candidates": [{"id": "only-one"}]}
+    assert review.to_call(one, {"verdict": "same", "keep": None, "confidence": 0.95, "reason": "x"})["p_keep"] == "only-one"
+
+
+def test_held_keep_given_as_candidate_number_listing_or_sentence():
+    held = {"kind": "held", "id": 7, "candidates": [
+        {"id": "4345a282-4b5d-4ea6", "listed_by": [{"listing_id": 32052}]},
+        {"id": "9fd1e0aa-1111-2222", "listed_by": [{"listing_id": 26034}, {"listing_id": 26035}]}]}
+    for keep, want in (("C2", "9fd1e0aa-1111-2222"), ("candidate 1", "4345a282-4b5d-4ea6"), ("2", "9fd1e0aa-1111-2222"),
+                       ("listing 26034", "9fd1e0aa-1111-2222"), ("32052", "4345a282-4b5d-4ea6"),
+                       ("the row 4345a282 (Moving in November)", "4345a282-4b5d-4ea6")):
+        c = review.to_call(held, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})
+        assert c["p_verdict"] == "same" and c["p_keep"] == want, keep
+    # still unsure when the answer points nowhere or at both
+    for keep in ("C3", "listing 99999", "x"):
+        assert review.to_call(held, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})["p_verdict"] == "unsure"
+
+
+def test_pair_keep_given_as_listing_id():
+    pair = {"kind": "pair", "id": 10, "a": {"id": "aaaa1111-x", "listed_by": [{"listing_id": 7185, "rank": 1}]},
+            "b": {"id": "bbbb2222-y", "listed_by": [{"listing_id": 58062, "rank": 1}, {"listing_id": 3, "rank": 3}]}}
+    assert review.to_call(pair, {"verdict": "same", "keep": "listing 7185", "confidence": 0.9, "reason": "x"})["p_keep"] == "aaaa1111-x"
 
 
 def test_verdict_must_fit_the_case():
