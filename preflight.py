@@ -6,7 +6,7 @@ is there readable content, does it mention dance and dates. Takes a screenshot o
 Uses no Claude tokens. Writes only its findings, to the source_checks table (nothing on the site changes).
 
   python preflight.py                     # all sources
-  python preflight.py --shard 0 --shards 12
+  python preflight.py --shard 0 --shards 20
   python preflight.py --name "Opera"
 """
 import argparse

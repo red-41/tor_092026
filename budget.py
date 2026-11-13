@@ -1,6 +1,6 @@
 """Spending cap: every Claude request is paid from a small block reserved in the database first.
 
-The ledger (collector_spend) is shared by the 12 parallel collect jobs and the duplicate check of one workflow run
+The ledger (collector_spend) is shared by the 20 parallel collect jobs and the duplicate check of one workflow run
 (they share GITHUB_RUN_ID). A block is refused when it would take the calendar month (UTC) past
 MONTHLY_BUDGET_USD or the run past RUN_BUDGET_USD; the collector then stops sending pages, exactly as when the
 Anthropic credit runs out (what was found is kept, the rest stays due).

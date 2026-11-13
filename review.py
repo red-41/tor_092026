@@ -249,17 +249,42 @@ def keep_id(case: dict, keep) -> str | None:
     (several candidates: None, a person decides)."""
     k = str(keep or "").strip().lower()
     if case["kind"] == "held":
-        ids = [c["id"] for c in case.get("candidates") or []]
+        cands = case.get("candidates") or []
+        ids = [c["id"] for c in cands]
         hit = [i for i in ids if k and (i.lower() == k or (len(k) >= 6 and i.lower().startswith(k)))]
         if len(hit) == 1:
             return hit[0]
+        # 12 Nov 2026: about half of the cases left for a person had a clear "same" whose keep was given as
+        # "C1" / "candidate 2" / a listing id / an id inside a sentence instead of the row id
+        m = re.fullmatch(r"(?:c|candidate|row|#)?\s*(\d{1,2})", k)
+        if m and 1 <= int(m.group(1)) <= len(ids):
+            return ids[int(m.group(1)) - 1]
+        hit = _row_by_listing_or_text(k, cands)
+        if hit:
+            return hit
         return ids[0] if len(ids) == 1 else None
     a, b = case.get("a") or {}, case.get("b") or {}
     for label, p in (("a", a), ("b", b)):
         pid = str(p.get("id") or "").lower()
         if k in (label, "row " + label, "row_" + label) or (pid and (k == pid or (len(k) >= 6 and pid.startswith(k)))):
             return p.get("id")
+    hit = _row_by_listing_or_text(k, [a, b])
+    if hit:
+        return hit
     return a.get("id") if richness(a) >= richness(b) else b.get("id")
+
+
+def _row_by_listing_or_text(k: str, rows: list) -> str | None:
+    """The row meant by an answer that names one of its listings ("listing 26034", "26034") or contains its id."""
+    if not k:
+        return None
+    nums = set(re.findall(r"\d{3,}", k))
+    hit = [r.get("id") for r in rows
+           if nums & {str(l.get("listing_id")) for l in r.get("listed_by") or []}]
+    if len(hit) == 1:
+        return hit[0]
+    hit = [r.get("id") for r in rows if r.get("id") and r["id"].lower()[:8] in k]
+    return hit[0] if len(hit) == 1 else None
 
 
 def to_call(case: dict, v: dict) -> dict:

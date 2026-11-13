@@ -1,0 +1,251 @@
+"""The in-run copy removal and the reviewer's safety checks (no network, no database)."""
+import datetime as dt
+
+import review
+from extract import clean_performance, merge, time_seen
+
+TODAY = dt.date(2026, 9, 24)
+
+
+def item(**kw):
+    base = {"title": "Afanador", "date": "2026-09-28", "time": "19:00", "tags": ["Contemporary"],
+            "venue": "Gamle Scene", "city": "Copenhagen"}
+    base.update(kw)
+    return clean_performance(base, TODAY)
+
+
+def test_copy_without_venue_is_dropped():
+    out = merge([item(), item(venue=None), item(venue=None, time=None)])
+    assert len(out) == 1 and out[0]["venue"] == "Gamle Scene"
+
+
+def test_venue_less_item_kept_when_it_is_the_only_one():
+    out = merge([item(venue=None), item(date="2026-09-29", venue="Gamle Scene")])
+    assert len(out) == 2
+
+
+def test_utc_twin_dropped_by_page_text():
+    local, utc = item(time="19:00"), item(time="17:00")
+    local["time_seen"] = time_seen("19:00", "Mon 28 Sep 19.00 Gamle Scene")
+    utc["time_seen"] = time_seen("17:00", "Mon 28 Sep 19.00 Gamle Scene")
+    out = merge([utc, local])
+    assert [o["time"] for o in out] == ["19:00"]
+
+
+def test_matinee_and_evening_both_kept():
+    a, b = item(time="14:00"), item(time="19:30")
+    a["time_seen"] = b["time_seen"] = True
+    assert len(merge([a, b])) == 2
+
+
+def test_twins_kept_when_page_shows_both():
+    a, b = item(time="18:00"), item(time="19:00")
+    a["time_seen"] = b["time_seen"] = True             # two real sessions an hour apart
+    assert len(merge([a, b])) == 2
+
+
+def test_time_seen_formats():
+    assert time_seen("19:30", "kl. 19.30")
+    assert time_seen("20:00", "20h")
+    assert time_seen("19:30", "7:30 pm")
+    assert not time_seen("17:30", "19:30 and 21:30")
+    assert not time_seen(None, "19:30")
+
+
+PAIR = {"kind": "pair", "id": 7, "a": {"id": "A", "listed_by": [{"listing_id": 1, "url": "https://x.org/a", "rank": 1}]},
+        "b": {"id": "B", "listed_by": [{"listing_id": 2, "url": "https://y.org/b", "rank": 3}]}}
+CONFLICT = {"kind": "conflict", "id": 3, "performance": {"id": "P", "title": "Giselle", "listed_by": [
+    {"listing_id": 11, "url": "https://x.org"}, {"listing_id": 12, "url": "https://y.org"}]}}
+
+
+def test_confident_same_is_applied():
+    c = review.to_call(PAIR, {"verdict": "same", "keep": "A", "confidence": 0.95, "reason": "same show"})
+    assert c["p_verdict"] == "same" and c["p_keep"] == "A"
+
+
+def test_low_confidence_is_left_for_a_person():
+    c = review.to_call(PAIR, {"verdict": "same", "keep": "A", "confidence": 0.6, "reason": "maybe"})
+    assert c["p_verdict"] == "unsure" and c["p_keep"] is None
+
+
+def test_unusable_keep_falls_back_to_the_richer_row():
+    # the 5 October run left confident duplicates for a person only because the keep field was not a full id
+    rich = {"kind": "pair", "id": 8,
+            "a": {"id": "A", "time": "19:00", "listed_by": [{"rank": 3}]},
+            "b": {"id": "B", "time": "19:00", "ticket_url": "https://t", "venue": "Opera",
+                  "listed_by": [{"rank": 1}, {"rank": 3}]}}
+    for keep in ("Z", None, ""):
+        c = review.to_call(rich, {"verdict": "same", "keep": keep, "confidence": 0.95, "reason": "x"})
+        assert c["p_verdict"] == "same" and c["p_keep"] == "B"
+
+
+def test_keep_given_as_a_label_or_short_id_is_read():
+    pair = {"kind": "pair", "id": 9, "a": {"id": "2c503860-cfd3-4f87", "listed_by": []},
+            "b": {"id": "5de58af0-9045-4814", "listed_by": [{"rank": 1}, {"rank": 3}]}}
+    for keep in ("a", "Row A", "2c503860"):
+        assert review.to_call(pair, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})["p_keep"] == "2c503860-cfd3-4f87"
+
+
+def test_held_with_several_candidates_needs_a_real_answer():
+    held = {"kind": "held", "id": 5, "candidates": [{"id": "c1-aaaaaaaa"}, {"id": "c2-bbbbbbbb"}]}
+    assert review.to_call(held, {"verdict": "same", "keep": "x", "confidence": 0.95, "reason": "x"})["p_verdict"] == "unsure"
+    assert review.to_call(held, {"verdict": "same", "keep": "c2-bbbbbbbb", "confidence": 0.95, "reason": "x"})["p_keep"] == "c2-bbbbbbbb"
+    one = {"kind": "held", "id": 6, "candidates": [{"id": "only-one"}]}
+    assert review.to_call(one, {"verdict": "same", "keep": None, "confidence": 0.95, "reason": "x"})["p_keep"] == "only-one"
+
+
+def test_held_keep_given_as_candidate_number_listing_or_sentence():
+    held = {"kind": "held", "id": 7, "candidates": [
+        {"id": "4345a282-4b5d-4ea6", "listed_by": [{"listing_id": 32052}]},
+        {"id": "9fd1e0aa-1111-2222", "listed_by": [{"listing_id": 26034}, {"listing_id": 26035}]}]}
+    for keep, want in (("C2", "9fd1e0aa-1111-2222"), ("candidate 1", "4345a282-4b5d-4ea6"), ("2", "9fd1e0aa-1111-2222"),
+                       ("listing 26034", "9fd1e0aa-1111-2222"), ("32052", "4345a282-4b5d-4ea6"),
+                       ("the row 4345a282 (Moving in November)", "4345a282-4b5d-4ea6")):
+        c = review.to_call(held, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})
+        assert c["p_verdict"] == "same" and c["p_keep"] == want, keep
+    # still unsure when the answer points nowhere or at both
+    for keep in ("C3", "listing 99999", "x"):
+        assert review.to_call(held, {"verdict": "same", "keep": keep, "confidence": 0.9, "reason": "x"})["p_verdict"] == "unsure"
+
+
+def test_pair_keep_given_as_listing_id():
+    pair = {"kind": "pair", "id": 10, "a": {"id": "aaaa1111-x", "listed_by": [{"listing_id": 7185, "rank": 1}]},
+            "b": {"id": "bbbb2222-y", "listed_by": [{"listing_id": 58062, "rank": 1}, {"listing_id": 3, "rank": 3}]}}
+    assert review.to_call(pair, {"verdict": "same", "keep": "listing 7185", "confidence": 0.9, "reason": "x"})["p_keep"] == "aaaa1111-x"
+
+
+def test_verdict_must_fit_the_case():
+    assert review.to_call(PAIR, {"verdict": "dismiss", "confidence": 0.99, "reason": "x"})["p_verdict"] == "unsure"
+    assert review.to_call(CONFLICT, {"verdict": "same", "confidence": 0.99, "reason": "x"})["p_verdict"] == "unsure"
+
+
+def test_conflict_cannot_ignore_every_listing_or_unknown_ones():
+    ok = review.to_call(CONFLICT, {"verdict": "ignore_listings", "ignore_listing_ids": [12], "confidence": 0.9, "reason": "x"})
+    assert ok["p_verdict"] == "ignore_listings" and ok["p_ignore"] == [12]
+    all_ = review.to_call(CONFLICT, {"verdict": "ignore_listings", "ignore_listing_ids": [11, 12], "confidence": 0.9, "reason": "x"})
+    assert all_["p_verdict"] == "unsure"
+    bad = review.to_call(CONFLICT, {"verdict": "ignore_listings", "ignore_listing_ids": [99], "confidence": 0.9, "reason": "x"})
+    assert bad["p_verdict"] == "unsure"
+
+
+def test_page_excerpt_keeps_text_around_the_title():
+    text = "x" * 20000 + " Afanador 28 September 19.00 Gamle Scene " + "y" * 20000
+    part = review.around(text, ["Afanador"], limit=3000)
+    assert "Afanador 28 September 19.00" in part and len(part) <= 3000
+
+
+def test_case_urls_best_rank_first_and_capped():
+    urls = review.case_urls(PAIR)
+    assert urls == ["https://x.org/a", "https://y.org/b"]
+
+
+def test_main_flow_applies_only_confident_verdicts(monkeypatch, tmp_path):
+    import sys
+    import config
+    import db
+    calls = []
+    queue = [PAIR, CONFLICT]
+
+    def fake_rpc(name, params=None, timeout=600):
+        calls.append((name, params))
+        if name == "promote_staging_performances":
+            return [{"staging_id": 1, "action": "insert", "performance_id": "X", "detail": ""}]
+        if name == "review_queue":
+            return queue
+        if name == "apply_review":
+            return "ok"
+        return 0
+
+    answers = {"pair": {"verdict": "same", "keep": "A", "confidence": 0.97, "reason": "same show"},
+               "conflict": {"verdict": "ignore_listings", "ignore_listing_ids": [12], "confidence": 0.5, "reason": "?"}}
+    monkeypatch.setattr(db, "rpc", fake_rpc)
+    asked = []
+    monkeypatch.setattr(review, "ask", lambda client, model, case, pages, pay=None:
+                        asked.append((model, case["kind"])) or dict(answers[case["kind"]]))
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages"])
+    assert review.main() == 0
+    names = [c[0] for c in calls]
+    assert names[:5] == ["refresh_source_venues", "promote_staging_performances", "review_housekeeping",
+                         "refresh_evening_groups", "find_duplicate_candidates"]
+    applied = [c[1] for c in calls if c[0] == "apply_review"]
+    assert applied[0]["p_verdict"] == "same" and applied[0]["p_keep"] == "A"
+    assert applied[1]["p_verdict"] == "unsure"            # 0.5 confidence: left for a person
+    assert (tmp_path / "reports").exists()
+    # the confident verdict is the first model's; the unsure one got a second look by the stronger model
+    assert asked == [(config.MODEL, "pair"), (config.MODEL, "conflict"), (config.ESCALATE_MODEL, "conflict")]
+    assert "[second look]" in applied[1]["p_note"]
+
+
+def test_timezone_follows_the_country_of_the_date():
+    from run import _timezone
+    lisbon = {"country": "Portugal", "timezone": "Europe/Lisbon"}
+    assert _timezone({"country": "Spain", "timezone": "Europe/Lisbon", "date": "2027-04-15"}, lisbon) == "Europe/Madrid"
+    assert _timezone({"country": "Spain", "timezone": "Atlantic/Canary", "date": "2027-04-15"}, lisbon) == "Atlantic/Canary"
+    assert _timezone({"country": "Germany", "timezone": "Europe/London", "date": "2027-04-15"}, lisbon) == "Europe/Berlin"
+    assert _timezone({"country": "United States", "timezone": "America/Chicago", "date": "2027-02-04"}, lisbon) == "America/Chicago"
+    assert _timezone({"country": "Belgium", "timezone": "Europe/Paris", "date": "2027-01-26"}, lisbon) == "Europe/Paris"
+    assert _timezone({"country": "", "timezone": None}, lisbon) == "Europe/Lisbon"
+
+
+def test_one_failed_case_does_not_stop_the_review(monkeypatch, tmp_path):
+    import sys
+    import config
+    import db
+    applied = []
+
+    def fake_rpc(name, params=None, timeout=600):
+        if name == "review_queue":
+            return [PAIR, dict(PAIR, id=8)]
+        if name == "apply_review":
+            applied.append(params["p_id"])
+            if params["p_id"] == 7:
+                raise RuntimeError("apply_review: 400 boom")
+            return "ok"
+        return 0
+
+    monkeypatch.setattr(db, "rpc", fake_rpc)
+    monkeypatch.setattr(review, "ask", lambda *a: {"verdict": "different", "confidence": 0.95, "reason": "x"})
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["review.py", "--no-pages", "--no-publish"])
+    assert review.main() == 0
+    assert applied == [7, 8]
+
+
+def test_aggregator_ticket_links_are_replaced():
+    from run import _ticket
+    assert _ticket({"ticket_url": "https://teaterbilletter.dk/forestillinger/x-1", "detail_url": "https://www.kglteater.dk/en/dance/x/"}) == "https://www.kglteater.dk/en/dance/x/"
+    assert _ticket({"ticket_url": "https://www.viagogo.com/x", "detail_url": None}) is None
+    assert _ticket({"ticket_url": "https://billet.kglteater.dk/x", "detail_url": None}) == "https://billet.kglteater.dk/x"
+
+
+def test_lists_returned_as_text_are_read():
+    import json as _json
+    from extract import flatten, runs_of
+    prods = [{"title": "Giselle", "performances": [{"date": "2026-10-01", "time": "19:30"}],
+              "runs": [{"start": "2026-10-01", "end": "2026-10-09"}]}]
+    assert len(flatten({"productions": _json.dumps(prods)})) == 1
+    assert len(runs_of({"productions": _json.dumps(prods)})) == 1
+    assert flatten({"productions": "not json"}) == []
+    assert flatten({"productions": ["Giselle", {"title": "x", "performances": "[]"}]}) == []
+
+
+def test_empty_page_gets_a_fresh_browser():
+    from types import SimpleNamespace
+    import run
+    calls = []
+
+    class FakeBrowser:
+        def load(self, url):
+            calls.append("load")
+            text = "" if len(calls) == 1 else "x" * 500
+            return SimpleNamespace(text=text, events=[], error=None, blocked=None, screenshot=None, cookie="none")
+
+        def _restart(self):
+            calls.append("restart")
+
+    res = {"pages": 0, "screens": [], "cookies": [], "blocked": [], "notes": []}
+    snap = run.open_page(FakeBrowser(), res, "https://x.org")
+    assert calls == ["load", "restart", "load"] and snap is not None
